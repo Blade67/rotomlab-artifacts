@@ -195,6 +195,33 @@ jobs:
           done
           echo "OK: every fragment commit equals build.json's pin"
 
+          # The check that ties the manifest to the release rather than to a
+          # report about it: every URL the fragment publishes must name a file
+          # that exists, with the digest the fragment claims. A fragment whose
+          # URL basename does not match an uploaded asset parses perfectly and
+          # 404s on a user's first run, and nothing before this point would
+          # notice — the digests all came from the same JSON lines the URLs did.
+          echo "--- every URL names a file that was actually produced ---"
+          jq -r '[(.toolchains // {}), (.hostTools // {})]
+                 | map(to_entries[])
+                 | .[] | "\(.value["linux-amd64"].url) \(.value["linux-amd64"].sha256)"' "$f" \
+          | while read -r url want; do
+              name=${url##*/}
+              [ -f "out/$name" ] || { echo "FAIL: $name is in the manifest but not in out/"; exit 1; }
+              got=$(sha256sum "out/$name" | cut -d' ' -f1)
+              [ "$got" = "$want" ] || {
+                echo "FAIL: out/$name has digest $got, the manifest claims $want"; exit 1; }
+              echo "  ok  $name  $got"
+            done
+          echo "OK: every published artifact exists and matches its manifest digest"
+
+          # GPLv2 has no §6(d), so busybox's source is not optional and not a
+          # link. It has to be in the release.
+          bbsrc="busybox-$(jq -er .mirrors.busybox.version build.json).tar.bz2"
+          [ -f "out/$bbsrc" ] || {
+            echo "FAIL: $bbsrc is missing; GPLv2 requires it to accompany the binary"; exit 1; }
+          echo "OK: $bbsrc accompanies the busybox binary"
+
       - uses: actions/upload-artifact@v4
         with:
           name: manifest-fragment

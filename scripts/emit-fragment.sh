@@ -335,7 +335,7 @@ before=$(git -C "$RL" status --porcelain; git -C "$RL" rev-parse HEAD)
 # The merge, in the form it would be applied by hand. `*` recurses into
 # objects, so games.<id>.decomp.commit lands without disturbing makeTargets,
 # and arrays are replaced wholesale — which is why no array is emitted.
-MERGED="$OUT_DIR/embedded.merged.json"
+MERGED="$(dirname "$OUT_FILE")/embedded.merged.json"
 jq -s '.[0] * .[1]' "$BASE_MANIFEST" "$OUT_FILE" >"$MERGED" ||
   die "merge failed"
 log "merge   $BASE_MANIFEST * $(basename "$OUT_FILE") -> $MERGED"
