@@ -72,6 +72,13 @@ case "$COMMIT" in
   *[!0-9a-f]*) die "build.json: .decomps.$DECOMP.commit is not lowercase hex: $COMMIT" ;;
 esac
 
+# The game name becomes the artifact filename and, through the manifest, part
+# of a URL. Held to the same shape as the decomp name so neither can be reached
+# by anything build.json does not already say.
+case "$GAME" in
+  *[!A-Za-z0-9._-]*|'') die "build.json: .decomps.$DECOMP.games[0] is not filename-safe: $GAME" ;;
+esac
+
 # The version identifies the artifact's contents, which are determined entirely
 # by the pinned commit — nothing else in this script varies. Naming it after
 # the commit is therefore truthful, and it keeps the decomp-commit ->
