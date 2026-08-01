@@ -1,0 +1,134 @@
+name: host tools
+
+# Builds the per-decomp host-tool artifacts and checks the shape of what came
+# out. Separate from spike.yml, which is the one-off musl gate and is kept as
+# the record of that answer; this one is the real build, and Task 8's
+# release.yml will call the same script.
+#
+# Matrixed over all three decomps with fail-fast off, so one run answers the
+# question for every game and a failure in one still reports the others.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/build-host-tools.sh
+      - scripts/lib.sh
+      - build.json
+      - tools-hash/**
+      - Containerfile
+      - .github/workflows/host-tools.yml
+
+jobs:
+  host-tools:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        decomp: [pokeemerald, pokefirered, pokeruby]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker rather than a container: job, because GitHub's runner injects a
+      # glibc-built node into container jobs, which cannot execute on Alpine.
+      # The package list mirrors Containerfile; go is needed for tools-hash.
+      #
+      # Values reach the shell through environment variables rather than ${{ }}
+      # interpolation. They come from the hardcoded matrix above so they are
+      # not attacker-controlled, but interpolating anything into a shell string
+      # is a habit worth not having in a workflow file.
+      - name: Build host tools statically under musl
+        env:
+          DECOMP: ${{ matrix.decomp }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -e DECOMP alpine:3.22 sh -c '
+            set -eu
+            apk add --no-cache --quiet \
+              build-base musl-dev \
+              libpng-dev libpng-static \
+              zlib-dev zlib-static \
+              git make file \
+              tar xz jq go >/dev/null
+            mkdir -p out
+            sh scripts/build-host-tools.sh "$DECOMP" >"out/$DECOMP.json"
+            echo "--- stdout (the manifest line) ---"
+            cat "out/$DECOMP.json"
+          '
+
+      # Inspects what was actually written, on the host, with none of the
+      # build script's own helpers involved — an independent look at the
+      # artifact rather than a restatement of the script's own claims.
+      - name: Inspect the artifact
+        env:
+          DECOMP: ${{ matrix.decomp }}
+          # tools-hash was run against pret/pokeemerald at the pinned commit
+          # 83df84e40623b79281f2397faa611cbf044170bd before this pipeline
+          # existed. A mismatch means the clone, the pin or the hash ordering
+          # is wrong; it is never the expectation that should be adjusted.
+          EMERALD_TOOLS_HASH: 8ca4d08f9c4a9206fe521fd8a6ad58923e4b25e656165c35a65ecaac744ca05a
+        run: |
+          set -eu
+          result="out/$DECOMP.json"
+          echo "--- $result ---"
+          jq . "$result"
+
+          artifact=$(jq -er .artifact "$result")
+          claimed_sha=$(jq -er .sha256 "$result")
+          tools_hash=$(jq -er .toolsHash "$result")
+          commit=$(jq -er .commit "$result")
+          want=$(jq -er '.tools | length' "$result")
+
+          echo "--- pinned commit ---"
+          echo "$commit"
+
+          echo "--- sha256 (recomputed on the host) ---"
+          sha256sum "out/$artifact"
+          actual_sha=$(sha256sum "out/$artifact" | cut -d' ' -f1)
+          [ "$actual_sha" = "$claimed_sha" ] || {
+            echo "sha256 mismatch: claimed $claimed_sha, actual $actual_sha"; exit 1; }
+
+          echo "--- tar listing ---"
+          tar -tvf "out/$artifact"
+
+          rm -rf extracted && mkdir extracted
+          tar -C extracted -xf "out/$artifact"
+
+          echo "--- extracted tree ---"
+          ls -l extracted
+
+          echo "--- linkage ---"
+          file extracted/*
+
+          # The exact shape hosttools.Provision requires: a flat directory of
+          # regular executable files, one per name in TOOL_NAMES.
+          nested=$(find extracted -mindepth 2 | wc -l)
+          [ "$nested" -eq 0 ] || { echo "artifact is not flat"; find extracted -mindepth 2; exit 1; }
+
+          got=$(find extracted -mindepth 1 | wc -l)
+          [ "$got" -eq "$want" ] || {
+            echo "artifact holds $got entries, expected $want"; exit 1; }
+
+          for t in $(jq -er '.tools[]' "$result"); do
+            [ -f "extracted/$t" ] || { echo "missing $t"; exit 1; }
+            [ -x "extracted/$t" ] || { echo "$t is not executable"; exit 1; }
+            file -b "extracted/$t" | grep -q "statically linked" || {
+              echo "$t is not statically linked: $(file -b "extracted/$t")"; exit 1; }
+          done
+          echo "OK: $got flat, static, executable tools"
+
+          if [ "$DECOMP" = pokeemerald ]; then
+            [ "$tools_hash" = "$EMERALD_TOOLS_HASH" ] || {
+              echo "toolsHash mismatch"
+              echo "  expected $EMERALD_TOOLS_HASH"
+              echo "  got      $tools_hash"
+              exit 1; }
+            echo "OK: toolsHash matches the independently computed anchor"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hosttools-${{ matrix.decomp }}
+          path: |
+            out/*.tar.xz
+            out/*.json
+          if-no-files-found: error
