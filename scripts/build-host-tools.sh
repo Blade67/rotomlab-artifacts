@@ -166,7 +166,13 @@ log "tools   $TOOL_COUNT: $TOOL_NAMES"
 log "hash    computing toolsHash on the pristine tree"
 # Built rather than `go run` because tools-hash is its own module: `go run
 # ./tools-hash` from the repo root has no module to resolve against.
-GOTOOLCHAIN=local go build -C "$ROOT/tools-hash" -o "$WORK/tools-hash" . ||
+#
+# -buildvcs=false because go build otherwise stamps the enclosing repository's
+# git state into the binary, and reading that git state fails outright when the
+# checkout is owned by a different uid than the build — exactly the case inside
+# a container with the repo bind-mounted. Nothing reads the stamp; this is a
+# throwaway helper, and its provenance is the commit this script lives in.
+GOTOOLCHAIN=local go build -C "$ROOT/tools-hash" -buildvcs=false -o "$WORK/tools-hash" . ||
   die "could not build tools-hash"
 TOOLS_HASH=$("$WORK/tools-hash" "$SRC")
 [ -n "$TOOLS_HASH" ] || die "tools-hash produced no output"
