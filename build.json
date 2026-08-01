@@ -1,0 +1,90 @@
+{
+  "_comment": "Every input to a RotomLab artifact release, pinned by version and SHA-256. Nothing is fetched that is not listed here, and nothing listed here is used without verifying its digest first.",
+
+  "decomps": {
+    "pokeemerald": {
+      "repo": "https://github.com/pret/pokeemerald",
+      "commit": "83df84e40623b79281f2397faa611cbf044170bd",
+      "games": ["emerald"]
+    },
+    "pokefirered": {
+      "repo": "https://github.com/pret/pokefirered",
+      "commit": "df4449a27cd78dd747ce269e47d3ab4a0149d8f4",
+      "games": ["firered", "leafgreen"]
+    },
+    "pokeruby": {
+      "repo": "https://github.com/pret/pokeruby",
+      "commit": "63a8cbf0016b351a4e68f7036fa0b77e23d2f2c1",
+      "games": ["ruby", "sapphire"]
+    }
+  },
+
+  "posix": {
+    "_comment": "Built from source under musl. GPLv3+, so recording the upstream URL discharges corresponding-source.",
+    "make": {
+      "version": "4.4.1",
+      "url": "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",
+      "sha256": "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3",
+      "licence": "GPL-3.0-or-later"
+    },
+    "bash": {
+      "version": "5.3",
+      "url": "https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz",
+      "sha256": "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba",
+      "licence": "GPL-3.0-or-later"
+    }
+  },
+
+  "mirrors": {
+    "busybox": {
+      "_comment": "1.35.0 is the newest official static build upstream publishes (2022-01-17); there is no 1.36 binary. GPLv2-only, which unlike GPLv3 has no provision for merely pointing at an upstream URL, so the source tarball is mirrored alongside the binary.",
+      "version": "1.35.0",
+      "url": "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox",
+      "sha256": "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
+      "source_url": "https://busybox.net/downloads/busybox-1.35.0.tar.bz2",
+      "source_sha256": "faeeb244c35a348a334f4a59e44626ee870fb07b6884d68c10ae8bc19f83a694",
+      "licence": "GPL-2.0-only"
+    },
+
+    "devkitarm": {
+      "_comment": "devkitARM is a metapackage with no files of its own (ISIZE 0). These five packages are its dependency closure, spanning two repo paths: arch-specific under packages/linux/x86_64/, any-arch under packages/. Each is a pacman .pkg.tar.zst carrying .PKGINFO/.MTREE/.BUILDINFO at its root, which must be dropped when merging the extracted trees.",
+      "version": "r68",
+      "buildscripts_tag": "devkitARM_r68",
+      "licence": "GPL-3.0-or-later",
+      "requires_user_agent": true,
+      "strip_prefix": "opt/devkitpro/devkitARM",
+      "packages": [
+        {
+          "name": "devkitarm-binutils",
+          "version": "2.46.0-1",
+          "url": "https://pkg.devkitpro.org/packages/linux/x86_64/devkitarm-binutils-2.46.0-1-x86_64.pkg.tar.zst",
+          "sha256": "fbca692c5b30008bef6b54c6b6cb48b6a03a656d7cc07beafa4dc7fdaa5838cf"
+        },
+        {
+          "name": "devkitarm-gcc",
+          "version": "16.1.0-1",
+          "url": "https://pkg.devkitpro.org/packages/linux/x86_64/devkitarm-gcc-16.1.0-1-x86_64.pkg.tar.zst",
+          "sha256": "289be1a7a42321e02d8dad037acfdfbbe73cfe283b685b4d3860a2e946ea92d0"
+        },
+        {
+          "name": "devkitarm-newlib",
+          "version": "4.6.0.20260123-5",
+          "url": "https://pkg.devkitpro.org/packages/devkitarm-newlib-4.6.0.20260123-5-any.pkg.tar.zst",
+          "sha256": "d314c644c143bd5b104bd82cdc27602f6449cf907cb9c37ccfb8c0707182f89d"
+        },
+        {
+          "name": "devkitarm-rules",
+          "version": "1.6.0-4",
+          "url": "https://pkg.devkitpro.org/packages/devkitarm-rules-1.6.0-4-any.pkg.tar.zst",
+          "sha256": "35023b2b5f07a2dcfb600063854c712206341fb5df3ffbaf8ff825d3cbc15fcc"
+        },
+        {
+          "name": "devkitarm-crtls",
+          "version": "1.2.6-1",
+          "url": "https://pkg.devkitpro.org/packages/devkitarm-crtls-1.2.6-1-any.pkg.tar.zst",
+          "sha256": "65faf10f62c219a1a8a3a182b0c4c56da7992599035ea32b3d79e39e79f964bb"
+        }
+      ]
+    }
+  }
+}
