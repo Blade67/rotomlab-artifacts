@@ -9,7 +9,8 @@
 #
 # bash specifically, and not busybox ash: all three decomps open with
 #
-#     SHELL := bash -o pipefail          (pokeruby spells it /bin/bash)
+#     SHELL := bash -o pipefail                 pokeemerald, pokefirered
+#     SHELL := /bin/bash -o pipefail            pokeruby
 #
 # ash has no `pipefail`, so substituting it makes the shell reject its own
 # invocation and every recipe line fails before it runs. A real bash is
@@ -17,6 +18,14 @@
 # *working* — not merely being accepted — is the property the whole decision
 # rests on. That is why the checks below run the flag for its effect rather
 # than grep for it in --help.
+#
+# Note for whoever wires up the invocation: pokeruby's absolute /bin/bash
+# bypasses PATH, so shipping this bash and putting it on PATH satisfies
+# pokeemerald and pokefirered but NOT pokeruby — that one needs SHELL
+# overridden on the make command line, or the makefile patched. Verified
+# against all three pinned commits, top-level and included .mk files alike;
+# no other file sets SHELL, and none uses make's `load` directive (which is
+# why --disable-load below costs nothing).
 #
 # Output, under out/:
 #   make-<version>-linux-amd64
