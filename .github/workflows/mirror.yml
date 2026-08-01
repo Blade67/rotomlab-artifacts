@@ -1,0 +1,217 @@
+name: mirror
+
+# Mirrors the two binaries we do not build: devkitPro's ARM toolchain and
+# upstream busybox's official static build.
+#
+# Split from posix.yml because the failure modes have nothing in common. The
+# POSIX layer is a compile whose risk is linkage; this is a repackaging whose
+# risk is *layout* — devkitARM arrives as five pacman packages that have to be
+# merged into the exact tree RotomLab's stripPrefix expects, and a tree
+# assembled one directory off installs as an empty directory with no error at
+# all, because fetch's untar skips members outside the prefix rather than
+# failing on them. So the layout is asserted here, twice, from both sides.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/mirror.sh
+      - scripts/lib.sh
+      - build.json
+      - Containerfile
+      - .github/workflows/mirror.yml
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker rather than a container: job, because GitHub's runner injects a
+      # glibc-built node into container jobs, which cannot execute on Alpine.
+      #
+      # Nothing is interpolated into the shell with ${{ }}; every value comes
+      # from build.json, inside the container.
+      #
+      # This runs on Alpine even though nothing here is compiled, so the
+      # mirroring happens in the same environment as every other artifact and
+      # busybox's staticness is asserted by a musl box that has no glibc to
+      # fall back on. The one thing Alpine cannot do is *run* devkitARM —
+      # upstream ships dynamically linked glibc PIEs — which is what the
+      # glibc-host job below is for.
+      - name: Mirror devkitARM and busybox
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -c '
+            set -eu
+            apk add --no-cache --quiet \
+              curl jq tar xz zstd bzip2 file >/dev/null
+            mkdir -p out
+            sh scripts/mirror.sh >out/mirror.json
+            echo "--- stdout (the manifest line) ---"
+            cat out/mirror.json
+          '
+
+      # An independent look at what was actually written, on the host, with
+      # none of the script's own helpers involved.
+      - name: Inspect the artifacts
+        run: |
+          set -eu
+          echo "--- out/mirror.json ---"
+          jq . out/mirror.json
+
+          dka="out/$(jq -er .devkitarm.artifact out/mirror.json)"
+          bb="out/$(jq -er .busybox.artifact out/mirror.json)"
+          src="out/$(jq -er .busybox.source.artifact out/mirror.json)"
+          prefix=$(jq -er .devkitarm.stripPrefix out/mirror.json)
+
+          echo "--- files ---"
+          ls -l "$dka" "$bb" "$src"
+          file "$bb"
+
+          echo "--- sha256 (recomputed on the host) ---"
+          sha256sum "$dka" "$bb" "$src"
+          for pair in "devkitarm:$dka" "busybox:$bb"; do
+            key=${pair%%:*}; path=${pair#*:}
+            claimed=$(jq -er ".$key.sha256" out/mirror.json)
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            [ "$actual" = "$claimed" ] || {
+              echo "$key sha256 mismatch: claimed $claimed, actual $actual"; exit 1; }
+          done
+          claimed=$(jq -er .busybox.source.sha256 out/mirror.json)
+          actual=$(sha256sum "$src" | cut -d' ' -f1)
+          [ "$actual" = "$claimed" ] || {
+            echo "busybox source sha256 mismatch"; exit 1; }
+          echo "OK: all three digests match the reported manifest line"
+
+          # The digests of the two mirrored busybox files must also equal the
+          # pins in build.json. They are upstream's bytes; if they differ,
+          # something in this pipeline rewrote a file it was only supposed to
+          # carry.
+          for pair in "url:sha256:$bb" "source_url:source_sha256:$src"; do
+            shafield=$(echo "$pair" | cut -d: -f2); path=${pair##*:}
+            want=$(jq -er ".mirrors.busybox.$shafield" build.json)
+            got=$(sha256sum "$path" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || {
+              echo "$path does not match build.json's $shafield pin"; exit 1; }
+          done
+          echo "OK: busybox binary and source are byte-identical to their pins"
+
+          echo "--- devkitARM: how the archive is structured ---"
+          tar -tvf "$dka" | head -n 20
+          echo "  ... $(tar -tf "$dka" | wc -l) members total"
+
+          # RotomLab's untar handles directories, regular files and symlinks
+          # and silently skips everything else. A hard-link member would
+          # therefore be missing after install, and GCC ships several of its
+          # drivers as hard links.
+          echo "--- devkitARM: member types ---"
+          tar -tvf "$dka" | cut -c1 | sort | uniq -c
+          if tar -tvf "$dka" | grep -q '^h'; then
+            echo "FAIL: hard-link members present; RotomLab's untar skips them"
+            tar -tvf "$dka" | grep '^h' | head; exit 1
+          fi
+          echo "OK: no hard-link members"
+
+          # The layout check, done the way RotomLab does it: strip the prefix
+          # and see whether a compiler falls out. This is the one that stops a
+          # wrong tree reaching users, where it would present as a toolchain
+          # directory containing nothing.
+          echo "--- devkitARM: the layout stripPrefix depends on ---"
+          rm -rf extracted && mkdir extracted
+          tar -C extracted -xf "$dka"
+          ls -l extracted "extracted/$prefix"
+          for t in arm-none-eabi-gcc arm-none-eabi-g++ arm-none-eabi-as \
+                   arm-none-eabi-ld arm-none-eabi-objcopy; do
+            [ -f "extracted/$prefix/bin/$t" ] || {
+              echo "FAIL: no $prefix/bin/$t in the artifact"; exit 1; }
+          done
+          echo "OK: $prefix/bin holds the toolchain"
+
+          # Nothing outside the prefix survives installation, so anything there
+          # is dead weight in a 250MB download. Reported, not fatal.
+          echo "--- members outside $prefix (dropped on install) ---"
+          tar -tf "$dka" | grep -v "^$prefix/" | grep -v '/$' | head -n 20 || echo "  (none)"
+
+          echo "--- busybox source is really a source tarball ---"
+          bzip2 -t "$src"
+          tar -tf "$src" | head -n 5
+          tar -tf "$src" | grep -qx "busybox-$(jq -er .busybox.version out/mirror.json)/Makefile" || {
+            echo "FAIL: no Makefile at the root of the busybox source tarball"; exit 1; }
+          echo "OK: GPLv2 corresponding source is present and intact"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mirror-linux-amd64
+          path: |
+            out/devkitarm-*.tar.xz
+            out/busybox-*
+            out/mirror.json
+          if-no-files-found: error
+
+  # devkitPro's binaries are dynamically linked glibc PIEs. That is upstream's
+  # build, not ours, and it is not something we can change — so the check that
+  # the compiler actually runs cannot happen on the musl box that packaged it.
+  # It happens here, on a stock glibc runner that had no part in the mirroring,
+  # using the identical assertions via VERIFY_ONLY so the two sides cannot
+  # drift apart.
+  glibc-host:
+    needs: mirror
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mirror-linux-amd64
+          path: downloaded
+
+      - name: Show the host is glibc, not musl
+        run: |
+          set -eu
+          . /etc/os-release && echo "host: $PRETTY_NAME"
+          ldd --version | head -n1
+
+      - name: Run the mirrored binaries on glibc
+        run: |
+          set -eu
+          # upload-artifact zips, and zip does not carry the executable bit
+          # through reliably. These files are owned by the runner, so this is
+          # a chmod and not a story about the mirror.
+          chmod +x downloaded/busybox-*-linux-amd64
+          bb=$(ls downloaded/busybox-*-linux-amd64)
+          dka=$(ls downloaded/devkitarm-*.tar.xz)
+
+          echo "--- busybox, on glibc ---"
+          file "$bb"
+          ldd "$bb" || true
+          "$bb" --list | wc -l
+
+          echo "--- devkitARM, on glibc ---"
+          rm -rf dka && mkdir dka
+          tar -C dka -xf "$dka"
+          gcc=dka/opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc
+          file "$gcc"
+          ldd "$gcc" || true
+          "$gcc" --version
+          "$gcc" -print-multi-lib
+
+          # A compiler that answers --version but cannot produce an object file
+          # would pass every check above and fail on a user's first build.
+          # This is the smallest end-to-end proof that the merge produced a
+          # working toolchain and not just a working driver: the driver has to
+          # find cc1 (gcc package), the assembler (binutils) and the headers
+          # (newlib), which is three of the five packages at once.
+          echo '#include <stdlib.h>' > t.c
+          echo 'int add(int a, int b) { return a + b; }' >> t.c
+          "$gcc" -mthumb-interwork -mcpu=arm7tdmi -O2 -c t.c -o t.o
+          ls -l t.o
+          dka/opt/devkitpro/devkitARM/bin/arm-none-eabi-objdump -h t.o | head -n 8
+          echo "OK: devkitARM compiled an ARM object file end to end"
+
+      # The same assertions the mirror ran, from the same source of truth.
+      - name: Re-run the full verification suite on glibc
+        run: |
+          set -eu
+          chmod +x downloaded/busybox-*-linux-amd64
+          bb=$(ls downloaded/busybox-*-linux-amd64)
+          dka=$(ls downloaded/devkitarm-*.tar.xz)
+          VERIFY_ONLY=1 sh scripts/mirror.sh "$PWD/$dka" "$PWD/$bb"
