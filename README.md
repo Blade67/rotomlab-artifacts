@@ -32,15 +32,28 @@ any Linux distribution regardless of its glibc version.
 
 ## Sources and licensing
 
-GNU Make, GNU Bash, and GCC (inside devkitARM) are licensed under the GPL. Publishing built
-binaries obliges us to provide the corresponding source.
+GNU Make, GNU Bash, busybox and GCC (inside devkitARM) are licensed under the GPL.
+Publishing built binaries obliges us to provide the corresponding source — and the three
+cases are not discharged the same way, which is why [`SOURCES.md`](SOURCES.md) spells each
+one out rather than listing URLs and leaving it there:
 
-Every component is built from **unmodified, pinned upstream releases** by the scripts in
-this repository. `SOURCES.md` records, for each release, the exact upstream URL and SHA-256
-of every source tarball and the container image used to build it. Nothing here is patched.
+- **`make` and `bash`** are built here from unmodified pinned tarballs by
+  `scripts/build-posix.sh`. GPLv3 §6(d) permits offering the source from a network
+  location, which is what their pinned URLs and digests are.
+- **`busybox`** is upstream's own static build, mirrored. It is GPLv2-**only**, and v2 has
+  no §6(d): linking to busybox.net is not a way to comply. Its source tarball is therefore
+  published in the same release as the binary.
+- **devkitARM** is devkitPro's build of *patched* GCC, binutils and newlib. Nothing here
+  compiles it, and the corresponding source is devkitPro's tree — not ftp.gnu.org's
+  releases of the same version numbers. `SOURCES.md` points at their `buildscripts`
+  repository at the pinned tag and commit.
+
+`SOURCES.md` is generated from `build.json` by `scripts/gen-sources.sh`, and CI fails if
+the two disagree: a corresponding-source notice that describes something other than what
+shipped is worse than none.
 
 The decomp build tools come from the [pret](https://github.com/pret) decompilation
-projects, at the commits pinned in `build.json`.
+projects, at the commits pinned in `build.json`, compiled unmodified.
 
 ## Reproducing a build
 

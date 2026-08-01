@@ -1,0 +1,204 @@
+name: fragment and sources
+
+# Builds every artifact, assembles the manifest fragment from what they
+# reported, and checks SOURCES.md is not stale.
+#
+# What this workflow CANNOT do, and why:
+#
+#   The fragment's real test is RotomLab's own manifest.Parse. RotomLab is a
+#   private repository and this one is public, so no job here can clone it
+#   without a cross-repository token — and giving a public repo's CI a token to
+#   a private repo, to run a *validation*, is a poor trade. That step therefore
+#   runs on a developer machine:
+#
+#     scripts/emit-fragment.sh ... --validate-against /path/to/RotomLab
+#
+#   which merges the fragment into that checkout's embedded.json, runs
+#   `go test ./internal/manifest/ -run Embedded` against the result in a
+#   throwaway `git archive HEAD` export, and verifies the checkout is unchanged
+#   afterwards. Recorded here so the gap is a documented boundary rather than
+#   something that looks like an oversight.
+#
+#   What this workflow does instead is everything that does not need the
+#   private schema: the fragment is assembled from real artifacts, and its
+#   shape is asserted against the rules manifest.validate() enforces — bare
+#   IDs, raw kinds carrying a filename, no path separators anywhere that
+#   reaches the filesystem.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/emit-fragment.sh
+      - scripts/gen-sources.sh
+      - scripts/lib.sh
+      - build.json
+      - SOURCES.md
+      - .github/workflows/fragment.yml
+
+jobs:
+  # Cheap and independent of everything else: SOURCES.md is generated from
+  # build.json, so a pin bumped without regenerating it means the published
+  # corresponding-source notice describes something other than what shipped.
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SOURCES.md is what gen-sources.sh produces
+        run: |
+          set -eu
+          sh scripts/gen-sources.sh - > /tmp/SOURCES.expected
+          if ! diff -u SOURCES.md /tmp/SOURCES.expected; then
+            echo
+            echo "SOURCES.md is stale. Run: sh scripts/gen-sources.sh"
+            exit 1
+          fi
+          echo "OK: SOURCES.md matches build.json"
+
+      # Every URL the corresponding-source offer points at has to resolve. A
+      # 404 in a GPL notice is a compliance defect, not a broken link, and it
+      # is the kind that is only noticed by whoever came looking for source.
+      - name: Every source URL in the offer resolves
+        run: |
+          set -eu
+          fail=0
+          for url in \
+            "$(jq -er .posix.make.url build.json)" \
+            "$(jq -er .posix.bash.url build.json)" \
+            "$(jq -er .mirrors.busybox.source_url build.json)" \
+            "https://github.com/devkitPro/buildscripts/tree/$(jq -er .mirrors.devkitarm.buildscripts_tag build.json)" \
+            "https://github.com/devkitPro/buildscripts/tree/$(jq -er .mirrors.devkitarm.buildscripts_commit build.json)"
+          do
+            # -I: whether the offer resolves, not thirty megabytes of proof
+            # that it does. The digests are checked where the file is actually
+            # fetched, by fetch_verify, which is the only place it matters.
+            code=$(curl -sSL -I -o /dev/null -w '%{http_code}' --retry 2 \
+                     -A 'rotomlab-artifacts (+https://github.com/Blade67/rotomlab-artifacts)' \
+                     "$url" || echo 000)
+            echo "  $code  $url"
+            [ "$code" = 200 ] || fail=1
+          done
+          [ "$fail" -eq 0 ] || { echo "FAIL: a corresponding-source URL does not resolve"; exit 1; }
+          echo "OK: every source URL in SOURCES.md resolves"
+
+  # The fragment is assembled from artifacts actually built in this run, not
+  # from fixtures. A fixture would keep passing after the JSON line the build
+  # scripts emit changed shape, which is exactly the coupling worth testing.
+  fragment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build every artifact and assemble the fragment
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -c '
+            set -eu
+            apk add --no-cache --quiet \
+              build-base musl-dev \
+              libpng-dev libpng-static zlib-dev zlib-static \
+              git make file \
+              curl jq tar xz gzip zstd bzip2 go >/dev/null
+            mkdir -p out
+            for d in pokeemerald pokefirered pokeruby; do
+              sh scripts/build-host-tools.sh "$d" >"out/$d.json"
+            done
+            sh scripts/build-posix.sh >out/posix.json
+            sh scripts/mirror.sh      >out/mirror.json
+
+            sh scripts/emit-fragment.sh \
+              --tag ci-check \
+              --hosttools out/pokeemerald.json \
+              --hosttools out/pokefirered.json \
+              --hosttools out/pokeruby.json \
+              --posix out/posix.json \
+              --mirror out/mirror.json
+          '
+          echo "--- manifest-fragment.json ---"
+          jq . out/manifest-fragment.json
+
+      # The rules manifest.validate() enforces, restated here because the real
+      # parser lives in a private repository this job cannot reach. Not a
+      # substitute for it — a floor under it.
+      - name: The fragment obeys the manifest's own rules
+        run: |
+          set -eu
+          f=out/manifest-fragment.json
+
+          echo "--- artifact IDs must be bare names ---"
+          jq -er '[(.toolchains // {} | keys[]), (.hostTools // {} | keys[]), (.games // {} | keys[])]
+                  | map(select(test("[/\\\\]") or . == "" or . == "." or . == ".."))
+                  | if length == 0 then true
+                    else error("not bare names: \(.)") end' "$f" >/dev/null
+          echo "OK: $(jq -r '[(.toolchains|keys[]),(.hostTools|keys[]),(.games|keys[])] | length' "$f") IDs are bare"
+
+          echo "--- RotomLab reads these four toolchain IDs by name ---"
+          for id in devkitarm make bash busybox; do
+            jq -er --arg id "$id" '.toolchains[$id]["linux-amd64"].url' "$f" >/dev/null || {
+              echo "FAIL: no toolchain $id"; exit 1; }
+            echo "  $id -> $(jq -r --arg id "$id" '.toolchains[$id]["linux-amd64"].url' "$f")"
+          done
+
+          echo "--- every raw download declares a bare filename ---"
+          jq -er '[(.toolchains // {}), (.hostTools // {})]
+                  | map(to_entries[])
+                  | map(select(.value["linux-amd64"].kind == "raw"))
+                  | map(select((.value["linux-amd64"].filename // "") == ""
+                            or (.value["linux-amd64"].filename | test("[/\\\\]"))))
+                  | if length == 0 then true
+                    else error("raw artifact with a bad filename: \(map(.key))") end' "$f" >/dev/null
+          echo "OK: manifest.validate() hard-fails a raw kind with no filename; none here lack one"
+
+          echo "--- kinds are ones fetch knows ---"
+          jq -er '[(.toolchains // {}), (.hostTools // {})]
+                  | map(to_entries[])
+                  | map(.value["linux-amd64"].kind)
+                  | map(select(. as $k | ["tar.xz","tar.zst","zip","raw"] | index($k) | not))
+                  | if length == 0 then true else error("unknown kinds: \(.)") end' "$f" >/dev/null
+          echo "OK: every kind is one of tar.xz, tar.zst, zip, raw"
+
+          echo "--- digests are 64 lowercase hex ---"
+          jq -er '[.. | objects | select(has("sha256")) | .sha256]
+                  | map(select(test("^[0-9a-f]{64}$") | not))
+                  | if length == 0 then true else error("bad digests: \(.)") end' "$f" >/dev/null
+          echo "OK: every sha256 is well formed"
+
+          echo "--- the triple: every game carries commit AND toolsHash ---"
+          jq -er '.games | to_entries
+                  | map(select((.value.decomp.commit // "") == ""
+                            or (.value.toolsHash // "") == ""
+                            or (.value.hostTools // "") == ""))
+                  | if length == 0 then true
+                    else error("games missing part of the triple: \(map(.key))") end' "$f" >/dev/null
+          jq -r '.games | to_entries[]
+                 | "  \(.key): \(.value.decomp.commit[0:12])  \(.value.toolsHash[0:12])  \(.value.hostTools)"' "$f"
+
+          # Games sharing a decomp must agree, or two projects built from one
+          # repository would disagree about which tree they came from.
+          jq -er '[.games | to_entries[] | {ht: .value.hostTools, c: .value.decomp.commit, t: .value.toolsHash}]
+                  | group_by(.ht)
+                  | map(select((map({c,t}) | unique | length) > 1))
+                  | if length == 0 then true
+                    else error("games sharing host tools disagree: \(.)") end' "$f" >/dev/null
+          echo "OK: games sharing a host-tools bundle agree on commit and toolsHash"
+
+          # Compared against build.json rather than trusting emit-fragment.sh
+          # to have compared them: this job's whole purpose is to be a second
+          # opinion, and repeating the check with the script's own helper would
+          # only restate its claim.
+          echo "--- the commits are build.json's, not something older ---"
+          for g in $(jq -r '.games | keys[]' "$f"); do
+            want=$(jq -er --arg g "$g" \
+              '[.decomps[] | select(.games | index($g)) | .commit] | first' build.json)
+            got=$(jq -er --arg g "$g" '.games[$g].decomp.commit' "$f")
+            [ "$want" = "$got" ] || {
+              echo "FAIL: $g is pinned at $want but the fragment says $got"; exit 1; }
+            echo "  $g: $got"
+          done
+          echo "OK: every fragment commit equals build.json's pin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest-fragment
+          path: |
+            out/manifest-fragment.json
+            out/*.json
+          if-no-files-found: error

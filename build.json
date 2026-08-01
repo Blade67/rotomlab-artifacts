@@ -1,21 +1,25 @@
 {
   "_comment": "Every input to a RotomLab artifact release, pinned by version and SHA-256. Nothing is fetched that is not listed here, and nothing listed here is used without verifying its digest first.",
 
+  "_decomps_comment": "hostToolsId is the artifact ID RotomLab's manifest already uses for this decomp's host-tool bundle. Pinned here rather than derived, because emit-fragment.sh writes it into games.<id>.hostTools and manifest.validate() rejects a game referencing an ID that does not exist — so a wrong value fails loudly instead of quietly adding an unreferenced entry.",
   "decomps": {
     "pokeemerald": {
       "repo": "https://github.com/pret/pokeemerald",
       "commit": "83df84e40623b79281f2397faa611cbf044170bd",
-      "games": ["emerald"]
+      "games": ["emerald"],
+      "hostToolsId": "emerald-hosttools-v1"
     },
     "pokefirered": {
       "repo": "https://github.com/pret/pokefirered",
       "commit": "df4449a27cd78dd747ce269e47d3ab4a0149d8f4",
-      "games": ["firered", "leafgreen"]
+      "games": ["firered", "leafgreen"],
+      "hostToolsId": "firered-hosttools-v1"
     },
     "pokeruby": {
       "repo": "https://github.com/pret/pokeruby",
       "commit": "63a8cbf0016b351a4e68f7036fa0b77e23d2f2c1",
-      "games": ["ruby", "sapphire"]
+      "games": ["ruby", "sapphire"],
+      "hostToolsId": "ruby-hosttools-v1"
     }
   },
 
@@ -57,6 +61,8 @@
       "_comment": "devkitARM is a metapackage with no files of its own (ISIZE 0). These five packages are its dependency closure, spanning two repo paths: arch-specific under packages/linux/x86_64/, any-arch under packages/. Each is a pacman .pkg.tar.zst carrying .PKGINFO/.MTREE/.BUILDINFO at its root, which must be dropped when merging the extracted trees.",
       "version": "r68",
       "buildscripts_tag": "devkitARM_r68",
+      "_buildscripts_comment": "The commit the tag resolved to on 2026-08-01. Recorded alongside the tag because a tag can be moved and a corresponding-source offer that points at a moving target is not an offer. Verified: devkitPro/buildscripts has no GitHub *release* for this tag, only the tag itself, so SOURCES.md must link to /tree/ and not /releases/tag/.",
+      "buildscripts_commit": "5be6f7a1214ec8d68054b2d0b6023aeb4ea56667",
       "licence": "GPL-3.0-or-later",
       "requires_user_agent": true,
       "strip_prefix": "opt/devkitpro/devkitARM",
