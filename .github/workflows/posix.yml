@@ -1,0 +1,154 @@
+name: posix layer
+
+# Builds the vendored POSIX layer — a static GNU make and a static GNU bash —
+# and then proves it works twice: once on the musl box that built it, and once
+# on a plain glibc runner that never saw the build.
+#
+# A separate workflow rather than a job in host-tools.yml: different inputs
+# (build.json's .posix, not .decomps), different artifacts, and no matrix. Its
+# path filter can then be tight, so editing a decomp pin does not rebuild bash
+# and editing bash does not rebuild eleven host tools.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/build-posix.sh
+      - scripts/lib.sh
+      - build.json
+      - Containerfile
+      - .github/workflows/posix.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker rather than a container: job, because GitHub's runner injects a
+      # glibc-built node into container jobs, which cannot execute on Alpine.
+      #
+      # Nothing is interpolated into the shell with ${{ }}. There is nothing
+      # variable to pass here, and there will not be: the versions come from
+      # build.json, inside the container.
+      - name: Build static make and bash under musl
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -c '
+            set -eu
+            apk add --no-cache --quiet \
+              build-base musl-dev \
+              make file \
+              curl jq tar gzip >/dev/null
+            mkdir -p out
+            sh scripts/build-posix.sh >out/posix.json
+            echo "--- stdout (the manifest line) ---"
+            cat out/posix.json
+          '
+
+      # An independent look at what was actually written, on the host, with
+      # none of the build script's helpers involved.
+      - name: Inspect the binaries
+        run: |
+          set -eu
+          echo "--- out/posix.json ---"
+          jq . out/posix.json
+
+          make_bin="out/$(jq -er .make.artifact out/posix.json)"
+          bash_bin="out/$(jq -er .bash.artifact out/posix.json)"
+
+          echo "--- files ---"
+          ls -l "$make_bin" "$bash_bin"
+          file "$make_bin" "$bash_bin"
+
+          echo "--- sha256 (recomputed on the host) ---"
+          sha256sum "$make_bin" "$bash_bin"
+          for pair in "make:$make_bin" "bash:$bash_bin"; do
+            key=${pair%%:*}; path=${pair#*:}
+            claimed=$(jq -er ".$key.sha256" out/posix.json)
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            [ "$actual" = "$claimed" ] || {
+              echo "$key sha256 mismatch: claimed $claimed, actual $actual"; exit 1; }
+          done
+          echo "OK: both digests match the reported manifest line"
+
+          for path in "$make_bin" "$bash_bin"; do
+            file -b "$path" | grep -q "statically linked" || {
+              echo "$path is not statically linked: $(file -b "$path")"; exit 1; }
+          done
+          echo "OK: both binaries are statically linked"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: posix-linux-amd64
+          path: |
+            out/make-*-linux-amd64
+            out/bash-*-linux-amd64
+            out/posix.json
+          if-no-files-found: error
+
+  # The point of static linking, demonstrated rather than inferred: the
+  # binaries are downloaded onto a stock glibc runner that had no part in
+  # building them, and put through the identical checks.
+  glibc-host:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: posix-linux-amd64
+          path: downloaded
+
+      - name: Show the host is glibc, not musl
+        run: |
+          set -eu
+          . /etc/os-release && echo "host: $PRETTY_NAME"
+          ldd --version | head -n1
+          echo "system bash: $(bash --version | head -n1)"
+
+      - name: Run the musl-static binaries on glibc
+        run: |
+          set -eu
+          # upload-artifact zips, and zip does not carry the executable bit
+          # through reliably. These files are owned by the runner, so this is
+          # a chmod and not a story about the build.
+          chmod +x downloaded/make-*-linux-amd64 downloaded/bash-*-linux-amd64
+
+          make_bin=$(ls downloaded/make-*-linux-amd64)
+          bash_bin=$(ls downloaded/bash-*-linux-amd64)
+
+          echo "--- what glibc's loader thinks of them ---"
+          file "$make_bin" "$bash_bin"
+          ldd "$make_bin" || true
+          ldd "$bash_bin" || true
+
+          echo "--- they run ---"
+          "$make_bin" --version | head -n1
+          "$bash_bin" --version | head -n1
+
+          echo "--- pipefail, behaviourally, on glibc ---"
+          on=0; "$bash_bin" -o pipefail -c 'false | true' || on=$?
+          off=0; "$bash_bin" -c 'false | true' || off=$?
+          echo "  with    pipefail: 'false | true' -> exit $on"
+          echo "  without pipefail: 'false | true' -> exit $off"
+          [ "$on" -ne 0 ] || { echo "FAIL: pipefail accepted but ignored"; exit 1; }
+          [ "$off" -eq 0 ] || { echo "FAIL: pipeline should exit 0 without pipefail"; exit 1; }
+          echo "  OK: pipefail changes the outcome, in both directions"
+
+          echo "--- make + our bash + SHELL override, on glibc ---"
+          printf 'SHELL := %s -o pipefail\n\nok:\n\t@echo "bash-$$BASH_VERSION"\n\nbroken:\n\t@false | true\n' \
+            "$PWD/$bash_bin" > Makefile.check
+          "$make_bin" -f Makefile.check --no-print-directory ok
+          if "$make_bin" -f Makefile.check --no-print-directory broken; then
+            echo "FAIL: make did not fail on a broken pipeline"; exit 1
+          fi
+          echo "  make correctly failed the broken pipeline"
+
+      # The same assertions the build ran, from the same source of truth, so
+      # the two sides cannot drift apart.
+      - name: Re-run the full verification suite on glibc
+        run: |
+          set -eu
+          make_bin=$(ls downloaded/make-*-linux-amd64)
+          bash_bin=$(ls downloaded/bash-*-linux-amd64)
+          VERIFY_ONLY=1 sh scripts/build-posix.sh "$PWD/$make_bin" "$PWD/$bash_bin"
