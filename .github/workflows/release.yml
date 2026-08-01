@@ -77,8 +77,10 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Declared per job, not at workflow level: preflight only checks out and runs
+# jq, and has no business holding a write token.
 permissions:
-  contents: write   # create the release, and push the regenerated SOURCES.md
+  contents: read
 
 jobs:
   # Everything that can fail in a second, before an hour of compiling. A
@@ -86,6 +88,8 @@ jobs:
   # script happened to read the broken key first.
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -108,6 +112,8 @@ jobs:
   release:
     needs: preflight
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release, and push the regenerated SOURCES.md
     # A cold run compiles three decomps' worth of host tools, GNU make, GNU
     # bash, and recompresses a gigabyte of devkitARM at xz -9.
     timeout-minutes: 180
@@ -146,18 +152,43 @@ jobs:
           # the same shape as everything else that crosses that boundary;
           # emit-fragment.sh applies the identical check and would refuse it
           # later, which is a worse place to find out.
+          #
+          # A leading '-' is rejected separately from the character class: it is
+          # made of legal characters but would be read as a flag by every gh and
+          # git invocation below. `gh release view -h` exits 0, which the
+          # existence check would then read as "a release already exists" —
+          # failing safe, but by accident. '.' and '..' are legal ref-name
+          # characters and illegal ref names.
           case "$TAG" in
-            *[!A-Za-z0-9._-]*|'') echo "release tag is not URL-safe: $TAG"; exit 1 ;;
+            -*|.|..|*[!A-Za-z0-9._-]*|'')
+              echo "release tag is not a safe URL and ref name: $TAG"; exit 1 ;;
           esac
 
           # An existing tag is refused, not reused. RotomLab's manifest pins
           # these asset URLs by digest; replacing the assets under a live tag
           # converts every working install into a digest mismatch on its next
           # fetch. A genuine re-cut passes an explicit tag.
+          #
+          # BOTH the release and the tag are checked, because they are different
+          # states. Deleting a GitHub release does not delete its tag, so the
+          # ordinary recovery path — cut, spot a problem, delete the release,
+          # re-run — leaves the tag behind. `gh release create` would then
+          # attach to that surviving tag, and the API documents target_commitish
+          # as "Unused if the Git tag already exists": the tag would silently
+          # keep pointing at the OLD commit while the release body printed the
+          # new one. That breaks the property this whole scheme rests on — that
+          # the pair (tag, tagged commit) pins what was built and how.
+          exists=
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "FAIL: a release already exists for tag $TAG."
-            echo "Publishing over it would replace assets a shipped manifest already"
-            echo "pins by digest. Pass an explicit 'tag' input to cut a new one."
+            exists="a release"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            exists="a tag with no release (a deleted release leaves its tag behind)"
+          fi
+          if [ -n "$exists" ]; then
+            echo "FAIL: $TAG already exists on the remote as $exists."
+            echo "Publishing over it would either replace assets a shipped manifest"
+            echo "already pins by digest, or tag this release with an older commit."
+            echo "Pass an explicit 'tag' input to cut a new one, or delete the tag."
             [ "$DRY_RUN" = true ] || exit 1
             echo "(dry run: continuing anyway)"
           fi
@@ -195,6 +226,18 @@ jobs:
             # No force, no rebase. A concurrent push to this branch should stop
             # the release rather than be quietly absorbed into it: the run has
             # already decided which commit it is describing.
+            #
+            # Two things a reader of `git log` should know. First, this lands
+            # before the release is created, so a run that fails later leaves
+            # this commit naming a tag that does not exist. It is cosmetic and
+            # self-healing — the next run finds SOURCES.md current and commits
+            # nothing — but the message is a claim about the future, and that is
+            # why it says "for", not "released as".
+            #
+            # Second, this push uses GITHUB_TOKEN, and pushes made with
+            # GITHUB_TOKEN do not trigger workflows. SOURCES.md is in
+            # fragment.yml's push-path filter, so swapping this for a PAT or a
+            # deploy key would make every release kick off a full second build.
             git push origin "HEAD:$BRANCH"
             echo "committed and pushed the regenerated SOURCES.md"
           fi
@@ -228,6 +271,18 @@ jobs:
       # Values reach the shell through environment variables rather than ${{ }}
       # interpolation. The tag is operator-supplied on a manual dispatch, so
       # this is the one workflow where that habit is more than a habit.
+      #
+      # The decomp list is READ FROM build.json, never spelled out here. It was
+      # spelled out here once, and the consequence is worth recording: a fourth
+      # decomp added to build.json would have been built by nothing, while
+      # gen-sources.sh — which does iterate .decomps — described it in the
+      # committed SOURCES.md and in the release body, and every check in step 6
+      # passed, because each of them derives from the three JSON lines that were
+      # produced rather than from the four that were pinned. The release would
+      # have gone out green, carrying a tag whose whole stated purpose is to
+      # fingerprint the pin set, advertising four decomps and containing three.
+      # The failure would then have surfaced in RotomLab as surviving TODO
+      # placeholders at merge time — the wrong repository, days later.
       # ---------------------------------------------------------------------
       - name: Run every script in the container
         env:
@@ -240,10 +295,18 @@ jobs:
               set -eu
               mkdir -p out
 
-              for d in pokeemerald pokefirered pokeruby; do
+              # build.json owns this list. check-build-json.sh has already
+              # confirmed every key is a bare filename-safe name, so word
+              # splitting it is safe.
+              DECOMPS=$(jq -r ".decomps | keys[]" build.json)
+              [ -n "$DECOMPS" ] || { echo "build.json lists no decomps"; exit 1; }
+
+              set --
+              for d in $DECOMPS; do
                 echo "=================== $d ==================="
                 sh scripts/build-host-tools.sh "$d" >"out/$d.json"
                 cat "out/$d.json"
+                set -- "$@" --hosttools "out/$d.json"
               done
 
               echo "=================== posix ==================="
@@ -254,14 +317,21 @@ jobs:
               sh scripts/mirror.sh >out/mirror.json
               cat out/mirror.json
 
+              # apk add is unpinned against a moving alpine:3.22 tag, so the
+              # exact package set that produced these bytes is only knowable
+              # from this run. Recorded as an artifact rather than left in a log
+              # that expires.
+              apk info -v | sort >out/apk-manifest.txt
+
               echo "=================== fragment ==================="
+              # "$@" is one --hosttools pair per decomp in build.json, so a
+              # decomp that was built cannot be left out of the fragment and a
+              # decomp in the fragment cannot be one that was never built.
               sh scripts/emit-fragment.sh \
                 --tag "$TAG" \
-                --hosttools out/pokeemerald.json \
-                --hosttools out/pokefirered.json \
-                --hosttools out/pokeruby.json \
-                --posix     out/posix.json \
-                --mirror    out/mirror.json
+                "$@" \
+                --posix  out/posix.json \
+                --mirror out/mirror.json
             '
           echo "--- manifest-fragment.json ---"
           jq . out/manifest-fragment.json
@@ -309,15 +379,27 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          set -eu
+          # pipefail matters here: several checks below are `jq ... | while
+          # read`, and without it a jq that errors produces no lines, the loop
+          # iterates zero times, and the step exits 0 having verified nothing.
+          set -euo pipefail
 
           : >/tmp/assets
-          for f in out/pokeemerald.json out/pokefirered.json out/pokeruby.json; do
-            jq -er .artifact "$f" >>/tmp/assets
+          # Same source of truth as the build loop: build.json's decomps, not a
+          # list repeated here.
+          for d in $(jq -r '.decomps | keys[]' build.json); do
+            [ -f "out/$d.json" ] || { echo "FAIL: $d is pinned but produced no JSON line"; exit 1; }
+            jq -er .artifact "out/$d.json" >>/tmp/assets
           done
-          jq -er '.make.artifact, .bash.artifact' out/posix.json >>/tmp/assets
-          jq -er '.devkitarm.artifact, .busybox.artifact, .busybox.source.artifact' \
-            out/mirror.json >>/tmp/assets
+          # One jq -er per key. `jq -er '.a, .b'` takes its exit status from the
+          # LAST output only, so a missing .make would print the literal "null",
+          # append it, and exit 0.
+          for k in .make.artifact .bash.artifact; do
+            jq -er "$k" out/posix.json >>/tmp/assets
+          done
+          for k in .devkitarm.artifact .busybox.artifact .busybox.source.artifact; do
+            jq -er "$k" out/mirror.json >>/tmp/assets
+          done
           echo manifest-fragment.json >>/tmp/assets
 
           echo "--- assets to publish ---"
@@ -335,12 +417,19 @@ jobs:
           done </tmp/assets
           [ "$fail" -eq 0 ] || exit 1
 
-          # Nine assets: three host-tool bundles, make, bash, the busybox
-          # binary, the busybox source, devkitARM, and the fragment. Spelled
-          # out so that a script quietly producing one fewer file is a failure
-          # rather than a shorter release.
+          # One host-tools bundle per pinned decomp, plus six fixed assets:
+          # make, bash, the busybox binary, the busybox source, devkitARM and
+          # the fragment. Derived from build.json rather than hardcoded, so
+          # adding a decomp raises the expectation instead of tripping a
+          # tripwire — and so the number still means something. A literal 9 here
+          # was tautological: /tmp/assets is built from one `jq -er` per key
+          # under `set -e`, so it could only ever have been 9.
+          want=$(( $(jq '.decomps | length' build.json) + 6 ))
           n=$(wc -l </tmp/assets)
-          [ "$n" -eq 9 ] || { echo "FAIL: expected 9 assets, assembled $n"; exit 1; }
+          [ "$n" -eq "$want" ] || {
+            echo "FAIL: build.json pins $(jq '.decomps | length' build.json) decomps, so"
+            echo "      $want assets were expected; $n were assembled."; exit 1; }
+          echo "OK: $n assets, matching build.json's $(jq '.decomps | length' build.json) decomps + 6 fixed"
 
           echo "--- every manifest URL names an asset with the digest it claims ---"
           jq -r '[(.toolchains // {}), (.hostTools // {})]
@@ -395,12 +484,16 @@ jobs:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -eu
+          # Read, not restated: a Containerfile bumped to a new Alpine would
+          # otherwise leave every release body claiming the old one.
+          ALPINE=$(sed -n 's/^FROM  *//p' Containerfile | head -n1)
           bbver=$(jq -er .mirrors.busybox.version build.json)
           bbsrc=$(jq -er .busybox.source.artifact out/mirror.json)
 
           {
-            echo "Prebuilt binaries for [RotomLab]($REPO_URL). Everything here is built"
-            echo "inside \`alpine:3.22\` against musl and statically linked, except"
+            echo "Prebuilt binaries for RotomLab, published from [\`$GITHUB_REPOSITORY\`]($REPO_URL)."
+            echo "Everything here is built"
+            echo "inside \`$ALPINE\` against musl and statically linked, except"
             echo "devkitARM, which is devkitPro's own build repackaged."
             echo
             echo "Built from [\`$SHA\`]($REPO_URL/tree/$SHA) by \`.github/workflows/release.yml\`."
@@ -445,6 +538,21 @@ jobs:
           echo "--- release notes ($(wc -c </tmp/release-notes.md) bytes) ---"
           cat /tmp/release-notes.md
 
+      # ---------------------------------------------------------------------
+      # 8. Publish: draft, verify what actually landed, then make it visible
+      #
+      # `gh release create` creates the release first and uploads afterwards.
+      # Published directly, an upload that failed partway would leave a LIVE
+      # release under this tag holding a subset of the assets — with a manifest
+      # fragment beside it naming URLs that 404, and the tag now burnt, so the
+      # re-run refuses it. Draft first, diff what GitHub actually holds against
+      # what was assembled, and only then flip it visible.
+      #
+      # The diff is the point. The previous version of this step ran
+      # `gh release view --json assets` and printed the result, which reads like
+      # verification and asserts nothing: not the count, not the names, not that
+      # any asset has a non-zero size.
+      # ---------------------------------------------------------------------
       - name: Publish the release
         if: ${{ !inputs.dry_run }}
         env:
@@ -453,24 +561,43 @@ jobs:
           SHA: ${{ steps.sources.outputs.sha }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          set -eu
+          set -euo pipefail
           set --
           while read -r name; do set -- "$@" "out/$name"; done </tmp/assets
 
-          flags=""
-          if [ "$PRERELEASE" = true ]; then flags="--prerelease"; fi
-
-          # shellcheck disable=SC2086
           gh release create "$TAG" \
             --target "$SHA" \
             --title "RotomLab artifacts $TAG" \
             --notes-file /tmp/release-notes.md \
-            $flags \
+            --draft \
             "$@"
 
-          echo "--- published assets ---"
+          echo "--- what GitHub actually holds ---"
           gh release view "$TAG" --json assets \
-            --jq '.assets[] | "\(.name)  \(.size) bytes  \(.url)"'
+            --jq '.assets[] | "\(.name)\t\(.size)"' | sort >/tmp/published
+          cat /tmp/published
+
+          # Names must match exactly, in both directions.
+          sort /tmp/assets >/tmp/expected-names
+          cut -f1 /tmp/published >/tmp/published-names
+          if ! diff -u /tmp/expected-names /tmp/published-names; then
+            echo "FAIL: the published asset set is not the set that was assembled."
+            echo "The release is still a DRAFT and is not visible. Delete it, then re-run."
+            exit 1
+          fi
+
+          # A zero-byte asset uploads happily and downloads as nothing.
+          if awk -F'\t' '$2 == 0 {print; found=1} END {exit !found}' /tmp/published; then
+            echo "FAIL: the assets above uploaded as zero bytes. Release left as a draft."
+            exit 1
+          fi
+          echo "OK: all $(wc -l </tmp/published) assets present and non-empty"
+
+          flags=""
+          if [ "$PRERELEASE" = true ]; then flags="--prerelease"; fi
+          # shellcheck disable=SC2086
+          gh release edit "$TAG" --draft=false $flags
+          echo "--- published: $(gh release view "$TAG" --json url --jq .url) ---"
 
       - name: Dry run — nothing was published
         if: ${{ inputs.dry_run }}
@@ -491,4 +618,5 @@ jobs:
           name: release-metadata
           path: |
             out/*.json
+            out/apk-manifest.txt
           if-no-files-found: warn

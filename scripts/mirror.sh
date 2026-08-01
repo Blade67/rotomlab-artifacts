@@ -463,6 +463,14 @@ cp "$DL_DIR/$BB_SRC_ARTIFACT" "$OUT_DIR/$BB_SRC_ARTIFACT"
 if command -v bzip2 >/dev/null 2>&1; then
   bzip2 -t "$OUT_DIR/$BB_SRC_ARTIFACT" || die "the busybox source tarball is not valid bzip2"
   log "check   source tarball decompresses cleanly"
+elif [ -n "${CI:-}" ]; then
+  # In CI the environment is ours: Containerfile and every workflow install
+  # bzip2, so its absence is a broken environment rather than someone running
+  # this by hand on a minimal box. Nothing that publishes should skip the one
+  # check that opens the GPLv2 corresponding source.
+  die "bzip2 is not installed, but CI is set. This is the environment that
+publishes; it must not skip the check that the busybox source is a readable
+archive. Add bzip2 to the image (Containerfile has it)."
 else
   warn "bzip2 is not installed, so $BB_SRC_ARTIFACT was NOT opened."
   warn "Its digest matches the pin, but nothing here confirmed it is a readable"

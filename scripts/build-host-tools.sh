@@ -53,7 +53,7 @@ case "$DECOMP" in
   *[!A-Za-z0-9._-]*|'') die "not a valid decomp name: $DECOMP" ;;
 esac
 
-need git make gcc g++ file jq tar xz sed sha256sum go
+need git make gcc g++ file jq tar xz sed grep sha256sum go
 
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 
@@ -188,8 +188,16 @@ log "tools   $TOOL_COUNT: $TOOL_NAMES"
 # directories TOOL_NAMES lists, no files and no agbcc.
 # ---------------------------------------------------------------------------
 [ -d "$SRC/tools" ] || die "no tools/ directory in $DECOMP@$COMMIT"
-( cd "$SRC/tools" && find . -mindepth 1 -maxdepth 1 -type d ) |
-  sed 's|^\./||' | grep -vx agbcc | sort >"$WORK/tools-dirs"
+# A glob rather than `find | sed | grep | sort`: that pipeline's exit status is
+# sort's, so a find that failed would have written an empty tools-dirs and the
+# comparison below would have "detected" that every tool was missing. It would
+# have died either way, but for the wrong reason and with a misleading message.
+# The glob cannot half-succeed.
+for d in "$SRC"/tools/*/; do
+  [ -d "$d" ] || continue          # no match: the glob stays literal
+  n=${d%/}; n=${n##*/}
+  [ "$n" = agbcc ] || printf '%s\n' "$n"
+done | sort >"$WORK/tools-dirs"
 # shellcheck disable=SC2086
 printf '%s\n' $TOOL_NAMES | sort >"$WORK/tool-names"
 

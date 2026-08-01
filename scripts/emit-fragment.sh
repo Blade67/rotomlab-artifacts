@@ -122,9 +122,11 @@ done
 if [ -z "$BASE_URL" ]; then
   [ -n "$TAG" ] || die "--tag is required unless --base-url is given"
   # Release tags become part of a URL. Held to the same shape as everything
-  # else that crosses that boundary.
+  # else that crosses that boundary. A leading '-' is made of legal characters
+  # but is read as a flag by everything that later handles the tag, and '.' and
+  # '..' are legal ref-name characters that are illegal ref names.
   case "$TAG" in
-    *[!A-Za-z0-9._-]*) die "release tag is not URL-safe: $TAG" ;;
+    -*|.|..|*[!A-Za-z0-9._-]*|'') die "release tag is not a safe URL and ref name: $TAG" ;;
   esac
   BASE_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-Blade67/rotomlab-artifacts}/releases/download/$TAG"
 fi

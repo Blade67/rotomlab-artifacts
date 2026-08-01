@@ -69,11 +69,17 @@ log "ok      $FILE is valid JSON"
 # formed.
 # ---------------------------------------------------------------------------
 cat >"$WORK/shape.jq" <<'JQPROG'
-def hex40:    type == "string" and test("^[0-9a-f]{40}$");
-def hex64:    type == "string" and test("^[0-9a-f]{64}$");
+# \A and \z, not ^ and $. jq uses Oniguruma, where $ matches before a
+# trailing newline exactly as in Perl, so "ffff...ffff\n" passed a ^...$ digest
+# check here and was then rejected by emit-fragment.sh and mirror.sh, whose
+# fixed-width `case` globs do see the newline. Nothing bad got through, but the
+# preflight failed to catch what it advertises, and this file claims above that
+# a value passing here is one those guards will also accept.
+def hex40:    type == "string" and test("\\A[0-9a-f]{40}\\z");
+def hex64:    type == "string" and test("\\A[0-9a-f]{64}\\z");
 # Filename-safe: these become artifact filenames and, through the manifest,
 # parts of a URL. Same character class the build scripts enforce.
-def safe:     type == "string" and test("^[A-Za-z0-9._-]+$");
+def safe:     type == "string" and test("\\A[A-Za-z0-9._-]+\\z");
 def bare:     safe and . != "." and . != "..";
 def https:    type == "string" and startswith("https://");
 def nonempty: type == "string" and length > 0;
@@ -92,6 +98,12 @@ def nonempty: type == "string" and length > 0;
    else empty end),
 
   ($b.decomps // {} | to_entries[] | . as $d |
+    # Guarded: without this a decomp whose value is a string aborts the whole
+    # program with "Cannot index string with string", which names none of the
+    # problems this script exists to name all of.
+    if ($d.value | type) != "object" then
+      "decomps.\($d.key) is not an object"
+    else
     ([ (select($d.key | bare | not)
         | "decomps: key \"\($d.key)\" is not a bare filename-safe name"),
 
@@ -109,18 +121,18 @@ def nonempty: type == "string" and length > 0;
 
        (select($d.value.hostToolsId | bare | not)
         | "decomps.\($d.key).hostToolsId is not a bare name: \($d.value.hostToolsId // "(absent)")")
-     ][])),
+     ][]) end),
 
   # Game names are the manifest keys RotomLab looks games up by, and
   # emit-fragment.sh maps an artifact back to its decomp through games[0].
   # Two decomps claiming one game name makes both ambiguous.
-  ([$b.decomps // {} | .[] | .games // [] | .[]]
+  ([$b.decomps // {} | .[] | select(type == "object") | .games // [] | .[]]
    | group_by(.) | map(select(length > 1) | .[0])[]
    | "decomps: game name \"\(.)\" is claimed by more than one decomp"),
 
   # Two decomps sharing a hostToolsId would have the second silently overwrite
   # the first when the fragment is merged into the manifest.
-  ([$b.decomps // {} | .[] | .hostToolsId // empty]
+  ([$b.decomps // {} | .[] | select(type == "object") | .hostToolsId // empty]
    | group_by(.) | map(select(length > 1) | .[0])[]
    | "decomps: hostToolsId \"\(.)\" is used by more than one decomp"),
 
@@ -200,6 +212,11 @@ def nonempty: type == "string" and length > 0;
   ([$b.mirrors.devkitarm.packages // [] | .[] | .url // empty]
    | group_by(.) | map(select(length > 1) | .[0])[]
    | "mirrors.devkitarm.packages lists \(.) twice"),
+  # The name becomes the cache filename in mirror.sh, so two packages sharing
+  # one would download over each other and the merge would see one of them.
+  ([$b.mirrors.devkitarm.packages // [] | .[] | .name // empty]
+   | group_by(.) | map(select(length > 1) | .[0])[]
+   | "mirrors.devkitarm.packages uses the name \(.) more than once"),
 
 # ---- placeholders ---------------------------------------------------------
   # RotomLab ships unpublished values as TODO placeholders and refuses to build
