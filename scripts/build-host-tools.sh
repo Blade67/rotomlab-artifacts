@@ -160,6 +160,54 @@ TOOL_COUNT=$#
 log "tools   $TOOL_COUNT: $TOOL_NAMES"
 
 # ---------------------------------------------------------------------------
+# 2b. The parsed list must equal the directories it claims to describe
+#
+# Every check downstream of the parse above derives from the parse: the build
+# loop, the staged count, the extracted count, and the workflow's
+# `.tools | length`. They therefore agree with each other by construction —
+# and would agree just as contentedly on a list that is too short. The sed
+# matches `TOOL_NAMES :=` and `TOOL_NAMES =`; a second assignment spelled
+# `TOOL_NAMES += foo` matches nothing, contains no continuation, and defines
+# TOOL_NAMES no second time, so every guard above lets it through and the tool
+# is silently never built. toolsHash does not catch it either: that hashes the
+# sources under tools/, not the list of tools compiled from them. The failure
+# would reach a user as one missing binary, thousands of lines into a build.
+#
+# So the list is checked against something outside itself: the tree it
+# describes. Set equality in both directions — a directory with no TOOL_NAMES
+# entry is a tool that would not be built, and a TOOL_NAMES entry with no
+# directory is a name that cannot be.
+#
+# tools/agbcc is excluded on both sides. It is a separate pret repository,
+# cloned into tools/agbcc only for matching builds, deliberately absent from
+# TOOL_NAMES upstream, and excluded from toolsHash for the same reason. Only
+# directories are compared: TOOL_NAMES names directories to run make in, and a
+# stray regular file in tools/ is not one.
+#
+# Verified against all three pinned commits: tools/ holds exactly the eleven
+# directories TOOL_NAMES lists, no files and no agbcc.
+# ---------------------------------------------------------------------------
+[ -d "$SRC/tools" ] || die "no tools/ directory in $DECOMP@$COMMIT"
+( cd "$SRC/tools" && find . -mindepth 1 -maxdepth 1 -type d ) |
+  sed 's|^\./||' | grep -vx agbcc | sort >"$WORK/tools-dirs"
+# shellcheck disable=SC2086
+printf '%s\n' $TOOL_NAMES | sort >"$WORK/tool-names"
+
+unlisted=$(grep -vxF -f "$WORK/tool-names" "$WORK/tools-dirs" || true)
+undirected=$(grep -vxF -f "$WORK/tools-dirs" "$WORK/tool-names" || true)
+if [ -n "$unlisted" ] || [ -n "$undirected" ]; then
+  die "TOOL_NAMES does not match the directories under tools/ in $DECOMP@$COMMIT.
+The parse of $MK and every count derived from it agree with each other, so this
+is the only check that can see the difference.
+  in tools/ but not in TOOL_NAMES (would never be built):$(printf ' %s' $unlisted)
+  in TOOL_NAMES but not in tools/ (cannot be built):$(printf ' %s' $undirected)
+  parsed TOOL_NAMES: $TOOL_NAMES
+If upstream really did add a tool through a second assignment, this script has
+to learn to read it — not have the assertion relaxed."
+fi
+log "check   TOOL_NAMES equals the $TOOL_COUNT directories under tools/ (agbcc excluded)"
+
+# ---------------------------------------------------------------------------
 # 3. toolsHash, on the pristine tree, BEFORE building anything
 #
 # This ordering is the whole reason the steps are numbered. Every pret tool

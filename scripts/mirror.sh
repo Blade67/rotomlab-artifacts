@@ -456,9 +456,17 @@ cp "$DL_DIR/$BB_SRC_ARTIFACT" "$OUT_DIR/$BB_SRC_ARTIFACT"
 # It is the source, not a 404 page that happened to hash correctly — bunzip2
 # reading it end to end is a cheap way to say so. Skipped rather than required
 # if bzip2 is absent: the digest is the guarantee, this is the sanity check.
+#
+# The skip is announced. It was silent before, which is how the documented
+# reproduction container came to omit bzip2 and drop this check without anyone
+# noticing that the GPLv2 corresponding source was going out unopened.
 if command -v bzip2 >/dev/null 2>&1; then
   bzip2 -t "$OUT_DIR/$BB_SRC_ARTIFACT" || die "the busybox source tarball is not valid bzip2"
   log "check   source tarball decompresses cleanly"
+else
+  warn "bzip2 is not installed, so $BB_SRC_ARTIFACT was NOT opened."
+  warn "Its digest matches the pin, but nothing here confirmed it is a readable"
+  warn "archive. Install bzip2 (Containerfile has it) to restore the check."
 fi
 
 BB_SHA=$(sha256_of "$OUT_DIR/$BB_ARTIFACT")

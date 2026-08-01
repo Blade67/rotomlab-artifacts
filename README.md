@@ -30,6 +30,27 @@ repository's release history, and gives GPL corresponding-source a natural home.
 Everything is built in Alpine against musl and statically linked, so the binaries run on
 any Linux distribution regardless of its glibc version.
 
+## Releases
+
+`.github/workflows/release.yml` is manually dispatched and runs the whole pipeline in one
+go: it builds the container from `Containerfile`, runs every script inside it, re-runs each
+script's own verification suite on the glibc runner, and publishes the lot.
+
+Tags are `artifacts-<YYYY-MM-DD>-<first 8 hex of sha256(build.json)>`.
+
+Each asset already names itself — a host-tools tarball carries the decomp commit it was
+built from, `make` and `bash` carry their upstream versions — so the tag does not repeat
+any of that. What it adds is the one thing no filename carries: a fingerprint of the *set*
+of pins the release was cut from. `build.json` is exactly that set, so two tags ending in
+the same eight characters were built from identical inputs, and any pin change makes them
+differ. The date leads because tags sort lexically. The release is created on a specific
+commit of this repository, named in the release body and reachable through the tag, which
+pins the build scripts as well as the pins.
+
+An existing tag is refused rather than overwritten: a shipped manifest pins these asset
+URLs *by digest*, so replacing assets under a live tag turns working installs into digest
+mismatches.
+
 ## Sources and licensing
 
 GNU Make, GNU Bash, busybox and GCC (inside devkitARM) are licensed under the GPL.

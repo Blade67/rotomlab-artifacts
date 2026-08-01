@@ -135,8 +135,19 @@ terms it cannot verify; consult the repository at the pinned commit.
 
 Every binary built here is produced inside `alpine:3.22` and statically linked
 against musl, so it runs on any Linux distribution regardless of its glibc
-version. `Containerfile` records the image and the exact package list; the CI
-workflows install the same set.
+version.
+
+`Containerfile` is that image, and it is not a description of one:
+`.github/workflows/release.yml` builds it and runs the whole pipeline inside
+it, so the container recorded here is the one the published binaries came out
+of. Reproducing a release means building that file and running the same
+scripts.
+
+The per-artifact workflows — `host-tools.yml`, `posix.yml`, `mirror.yml`,
+`fragment.yml` — start from the same `alpine:3.22` base but install only the
+packages each one needs, so editing a decomp pin does not rebuild bash. They
+are the fast feedback path, not the release path, and this file describes the
+release path.
 
 ## Reproducing any of this
 

@@ -30,6 +30,7 @@ on:
     paths:
       - scripts/emit-fragment.sh
       - scripts/gen-sources.sh
+      - scripts/check-build-json.sh
       - scripts/lib.sh
       - build.json
       - SOURCES.md
@@ -43,6 +44,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First, and on its own. Every other script reads build.json through
+      # cfg() and fails on the one key it happened to need, so a malformed pin
+      # file is otherwise only caught by whichever job reaches that key — after
+      # a clone, a download or a compile has already been paid for. This step
+      # costs a second, needs no network, and reports every problem at once.
+      - name: build.json is well formed
+        run: sh scripts/check-build-json.sh
+
       - name: SOURCES.md is what gen-sources.sh produces
         run: |
           set -eu

@@ -1,0 +1,494 @@
+name: release
+
+# Runs the whole pipeline and publishes the result as a GitHub release.
+#
+# This is the workflow whose output users actually download. Everything else in
+# .github/workflows/ answers "does this still build?"; this one answers "is
+# this what RotomLab will fetch on a first run?", so it is the one place where
+# the release, the manifest fragment and the corresponding-source notice are
+# produced together from a single run and cannot describe different things.
+#
+# ---------------------------------------------------------------------------
+# The tag scheme:  artifacts-<YYYY-MM-DD>-<first 8 hex of sha256(build.json)>
+# ---------------------------------------------------------------------------
+# The artifacts already name themselves. A host-tools tarball carries the
+# decomp commit it was built from, make and bash carry their upstream versions,
+# devkitARM carries r68. Repeating any of that in the tag would be a second
+# copy of a fact that is already in the filename, and second copies go stale.
+#
+# What the tag has to identify is the thing no single filename carries: which
+# SET of pins was in effect. build.json is exactly that set and nothing else —
+# every decomp commit, every version, every digest — so its SHA-256 is a
+# precise fingerprint of "what is in this release". Two releases whose tags end
+# in the same eight characters were built from identical pins; any pin edit,
+# down to a comment, changes them. That is the property worth being able to
+# read off a tag at a glance.
+#
+# The date leads because tags sort lexically and a bare digest sorts by
+# nothing, and because "when was this cut" is the other question asked of a
+# release list.
+#
+# The digest covers WHAT was built, not HOW. The scripts are the how, and the
+# release is created on a specific commit of this repository, recorded in the
+# release body and reachable as `git show <tag>` since the tag points at it. So
+# the pair (tag, tagged commit) pins both halves, and neither is a copy of
+# something else.
+#
+# Re-running on the same day with unchanged pins therefore proposes a tag that
+# already exists. That is refused rather than overwritten: a published manifest
+# points at these asset URLs by digest, and replacing the assets under a live
+# tag turns a working install into a digest mismatch. Pass an explicit `tag`
+# input when a genuine re-cut is wanted.
+#
+# ---------------------------------------------------------------------------
+# GPLv3 §6(d) and the release body
+# ---------------------------------------------------------------------------
+# §6(d) requires that the offer of source ACCOMPANY the object code — "next to
+# the object code saying where to find the Corresponding Source". A SOURCES.md
+# sitting in the repository is not automatically adjacent to a release asset; a
+# user who lands on the release page sees download links and nothing else. So
+# the full text of SOURCES.md is written into the release body, on the same
+# page as the downloads, together with a permalink to it at the exact commit
+# the release was cut from. busybox's source tarball is named there explicitly
+# as the corresponding source for the busybox binary, because busybox is
+# GPLv2-only and v2 has no §6(d) at all: for that one, pointing anywhere is not
+# compliance, and the source has to be an asset in this release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (default: artifacts-<date>-<build.json digest>)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Build and verify everything, publish nothing'
+        type: boolean
+        required: false
+        default: false
+      prerelease:
+        description: 'Mark the release as a prerelease'
+        type: boolean
+        required: false
+        default: false
+
+# Two releases in flight at once would race on the SOURCES.md commit and could
+# publish two fragments claiming the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # create the release, and push the regenerated SOURCES.md
+
+jobs:
+  # Everything that can fail in a second, before an hour of compiling. A
+  # malformed pin file used to surface halfway through a build as whichever
+  # script happened to read the broken key first.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build.json is well formed
+        run: sh scripts/check-build-json.sh
+
+      # Not a hard failure here — the release job regenerates and commits it.
+      # Reported so that a stale file is visible as a deliberate regeneration
+      # in the log rather than as a surprise commit on main.
+      - name: Is SOURCES.md current?
+        run: |
+          set -eu
+          sh scripts/gen-sources.sh - >/tmp/SOURCES.expected
+          if diff -u SOURCES.md /tmp/SOURCES.expected; then
+            echo "OK: SOURCES.md is current"
+          else
+            echo "NOTE: SOURCES.md is stale; the release job will regenerate and commit it"
+          fi
+
+  release:
+    needs: preflight
+    runs-on: ubuntu-latest
+    # A cold run compiles three decomps' worth of host tools, GNU make, GNU
+    # bash, and recompresses a gigabyte of devkitARM at xz -9.
+    timeout-minutes: 180
+    steps:
+      # Full history: the release is created on a commit this job may push, and
+      # `gh release create --target` needs that commit to exist on the remote.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # 1. The tag
+      #
+      # Derived before anything is built, because emit-fragment.sh needs it:
+      # every asset URL in the manifest fragment is built from the tag, so the
+      # tag has to be decided before the fragment that references it exists.
+      # ---------------------------------------------------------------------
+      - name: Decide the release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ -n "$INPUT_TAG" ]; then
+            TAG=$INPUT_TAG
+            echo "tag given explicitly: $TAG"
+          else
+            pins=$(sha256sum build.json | cut -c1-8)
+            TAG="artifacts-$(date -u +%Y-%m-%d)-$pins"
+            echo "tag derived from build.json: $TAG"
+          fi
+
+          # The tag becomes part of every asset URL in the fragment. Held to
+          # the same shape as everything else that crosses that boundary;
+          # emit-fragment.sh applies the identical check and would refuse it
+          # later, which is a worse place to find out.
+          case "$TAG" in
+            *[!A-Za-z0-9._-]*|'') echo "release tag is not URL-safe: $TAG"; exit 1 ;;
+          esac
+
+          # An existing tag is refused, not reused. RotomLab's manifest pins
+          # these asset URLs by digest; replacing the assets under a live tag
+          # converts every working install into a digest mismatch on its next
+          # fetch. A genuine re-cut passes an explicit tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "FAIL: a release already exists for tag $TAG."
+            echo "Publishing over it would replace assets a shipped manifest already"
+            echo "pins by digest. Pass an explicit 'tag' input to cut a new one."
+            [ "$DRY_RUN" = true ] || exit 1
+            echo "(dry run: continuing anyway)"
+          fi
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 2. SOURCES.md, committed before the release is cut
+      #
+      # Ordering, not tidiness: the release body links to SOURCES.md at the
+      # released commit, and the tag is created on that commit. Regenerating
+      # afterwards would leave the permalink pointing at a version of the file
+      # that predates the release it describes.
+      # ---------------------------------------------------------------------
+      - name: Regenerate SOURCES.md and commit it if it changed
+        id: sources
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          BRANCH: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          sh scripts/gen-sources.sh
+
+          if git diff --quiet -- SOURCES.md; then
+            echo "SOURCES.md unchanged"
+          elif [ "$DRY_RUN" = true ]; then
+            echo "SOURCES.md would change (dry run, not committing):"
+            git --no-pager diff -- SOURCES.md
+            git checkout -- SOURCES.md
+          else
+            git config user.name  'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add SOURCES.md
+            git commit -m "docs: regenerate SOURCES.md for $TAG"
+            # No force, no rebase. A concurrent push to this branch should stop
+            # the release rather than be quietly absorbed into it: the run has
+            # already decided which commit it is describing.
+            git push origin "HEAD:$BRANCH"
+            echo "committed and pushed the regenerated SOURCES.md"
+          fi
+
+          SHA=$(git rev-parse HEAD)
+          echo "release commit: $SHA"
+          echo "sha=$SHA" >>"$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 3. The build environment, built from the file that documents it
+      #
+      # The other workflows apk-add a per-job subset for speed. This one builds
+      # Containerfile, so the image SOURCES.md tells people to reproduce with
+      # is the image the published bytes came out of, rather than a description
+      # of one that has never been executed. Containerfile was previously built
+      # by no workflow at all, and had drifted: it omitted bzip2, which silently
+      # disabled mirror.sh's check that the GPLv2 corresponding source is a
+      # readable archive.
+      # ---------------------------------------------------------------------
+      - name: Build the release container from Containerfile
+        run: |
+          set -eu
+          docker build -f Containerfile -t rotomlab-artifacts:release .
+          echo "--- what is in it ---"
+          docker run --rm rotomlab-artifacts:release sh -c \
+            'cat /etc/alpine-release; apk info | sort | tr "\n" " "; echo'
+
+      # ---------------------------------------------------------------------
+      # 4. The pipeline, in order
+      #
+      # Values reach the shell through environment variables rather than ${{ }}
+      # interpolation. The tag is operator-supplied on a manual dispatch, so
+      # this is the one workflow where that habit is more than a habit.
+      # ---------------------------------------------------------------------
+      - name: Run every script in the container
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e TAG -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL \
+            rotomlab-artifacts:release sh -c '
+              set -eu
+              mkdir -p out
+
+              for d in pokeemerald pokefirered pokeruby; do
+                echo "=================== $d ==================="
+                sh scripts/build-host-tools.sh "$d" >"out/$d.json"
+                cat "out/$d.json"
+              done
+
+              echo "=================== posix ==================="
+              sh scripts/build-posix.sh >out/posix.json
+              cat out/posix.json
+
+              echo "=================== mirrors ==================="
+              sh scripts/mirror.sh >out/mirror.json
+              cat out/mirror.json
+
+              echo "=================== fragment ==================="
+              sh scripts/emit-fragment.sh \
+                --tag "$TAG" \
+                --hosttools out/pokeemerald.json \
+                --hosttools out/pokefirered.json \
+                --hosttools out/pokeruby.json \
+                --posix     out/posix.json \
+                --mirror    out/mirror.json
+            '
+          echo "--- manifest-fragment.json ---"
+          jq . out/manifest-fragment.json
+
+      # ---------------------------------------------------------------------
+      # 5. Every published byte, run on a glibc host before it is published
+      #
+      # The runner is glibc; the container was musl. These are the identical
+      # assertions the build ran, re-run from the same source of truth on a
+      # machine that had no part in producing the files — which is also the
+      # only place devkitPro's dynamically linked glibc PIEs can be executed at
+      # all. posix.yml and mirror.yml do this against artifacts downloaded from
+      # a previous job; here the files are right there, so it costs nothing.
+      # ---------------------------------------------------------------------
+      - name: Re-run the verification suites on glibc
+        run: |
+          set -eu
+          . /etc/os-release && echo "host: $PRETTY_NAME"
+          ldd --version | head -n1
+
+          make_bin="out/$(jq -er .make.artifact out/posix.json)"
+          bash_bin="out/$(jq -er .bash.artifact out/posix.json)"
+          dka="out/$(jq -er .devkitarm.artifact out/mirror.json)"
+          bb="out/$(jq -er .busybox.artifact out/mirror.json)"
+
+          VERIFY_ONLY=1 sh scripts/build-posix.sh "$PWD/$make_bin" "$PWD/$bash_bin"
+          VERIFY_ONLY=1 sh scripts/mirror.sh      "$PWD/$dka"      "$PWD/$bb"
+
+      # ---------------------------------------------------------------------
+      # 6. The asset list
+      #
+      # Assembled from what the scripts reported, never from a glob over out/.
+      # out/ also holds dl/ — the verified download cache, a gigabyte of pacman
+      # packages — and staging/, and a glob that swept those into a release
+      # would be noticed by nobody until the upload finished.
+      #
+      # Each name is then checked to exist with the digest the fragment claims
+      # for it. A fragment whose URL basename does not match an uploaded asset
+      # parses perfectly and 404s on a user's first run; nothing earlier would
+      # catch it, because the URLs and the digests came from the same JSON
+      # lines and therefore agree with each other.
+      # ---------------------------------------------------------------------
+      - name: Assemble and verify the asset list
+        id: assets
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+
+          : >/tmp/assets
+          for f in out/pokeemerald.json out/pokefirered.json out/pokeruby.json; do
+            jq -er .artifact "$f" >>/tmp/assets
+          done
+          jq -er '.make.artifact, .bash.artifact' out/posix.json >>/tmp/assets
+          jq -er '.devkitarm.artifact, .busybox.artifact, .busybox.source.artifact' \
+            out/mirror.json >>/tmp/assets
+          echo manifest-fragment.json >>/tmp/assets
+
+          echo "--- assets to publish ---"
+          fail=0
+          while read -r name; do
+            case "$name" in
+              */*|*'\'*|''|.|..) echo "FAIL: not a bare filename: $name"; fail=1; continue ;;
+            esac
+            if [ -f "out/$name" ]; then
+              printf '  %-52s %10s bytes  %s\n' "$name" "$(wc -c <"out/$name")" \
+                "$(sha256sum "out/$name" | cut -d' ' -f1)"
+            else
+              echo "FAIL: out/$name was not produced"; fail=1
+            fi
+          done </tmp/assets
+          [ "$fail" -eq 0 ] || exit 1
+
+          # Nine assets: three host-tool bundles, make, bash, the busybox
+          # binary, the busybox source, devkitARM, and the fragment. Spelled
+          # out so that a script quietly producing one fewer file is a failure
+          # rather than a shorter release.
+          n=$(wc -l </tmp/assets)
+          [ "$n" -eq 9 ] || { echo "FAIL: expected 9 assets, assembled $n"; exit 1; }
+
+          echo "--- every manifest URL names an asset with the digest it claims ---"
+          jq -r '[(.toolchains // {}), (.hostTools // {})]
+                 | map(to_entries[])
+                 | .[] | "\(.value["linux-amd64"].url) \(.value["linux-amd64"].sha256)"' \
+                 out/manifest-fragment.json \
+          | while read -r url want; do
+              name=${url##*/}
+              grep -qxF "$name" /tmp/assets || {
+                echo "FAIL: the manifest names $name, which is not in the release"; exit 1; }
+              got=$(sha256sum "out/$name" | cut -d' ' -f1)
+              [ "$got" = "$want" ] || {
+                echo "FAIL: out/$name is $got, the manifest claims $want"; exit 1; }
+              echo "  ok  $name"
+            done
+
+          # Every asset URL must also carry this release's tag, or the manifest
+          # would point at a different release's assets.
+          bad=$(jq -r --arg t "$TAG" \
+            '[(.toolchains // {}), (.hostTools // {})] | map(to_entries[]) | .[]
+             | .value["linux-amd64"].url
+             | select(contains("/download/" + $t + "/") | not)' out/manifest-fragment.json)
+          [ -z "$bad" ] || { echo "FAIL: URLs do not carry this tag:"; echo "$bad"; exit 1; }
+          echo "OK: every fragment URL points into this release"
+
+          # GPLv2 §3 offers no equivalent of GPLv3 §6(d). busybox's source is
+          # not a link and not optional; it is an asset or there is no
+          # compliance. It appears in no manifest entry, so the loop above
+          # cannot be what checks for it.
+          bbsrc=$(jq -er .busybox.source.artifact out/mirror.json)
+          grep -qxF "$bbsrc" /tmp/assets ||
+            { echo "FAIL: $bbsrc is not in the release"; exit 1; }
+          want=$(jq -er .mirrors.busybox.source_sha256 build.json)
+          got=$(sha256sum "out/$bbsrc" | cut -d' ' -f1)
+          [ "$got" = "$want" ] ||
+            { echo "FAIL: $bbsrc is $got, build.json pins $want"; exit 1; }
+          echo "OK: $bbsrc accompanies the busybox binary, byte-identical to its pin"
+
+      # ---------------------------------------------------------------------
+      # 7. The release body
+      #
+      # SOURCES.md verbatim, on the same page as the downloads, because that is
+      # what §6(d) means by the offer accompanying the object code. Plus a
+      # permalink to it at the released commit, so the offer survives being
+      # copied out of the page, and an explicit statement naming the busybox
+      # source asset — the one component for which a link is not compliance.
+      # ---------------------------------------------------------------------
+      - name: Compose the release notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.sources.outputs.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -eu
+          bbver=$(jq -er .mirrors.busybox.version build.json)
+          bbsrc=$(jq -er .busybox.source.artifact out/mirror.json)
+
+          {
+            echo "Prebuilt binaries for [RotomLab]($REPO_URL). Everything here is built"
+            echo "inside \`alpine:3.22\` against musl and statically linked, except"
+            echo "devkitARM, which is devkitPro's own build repackaged."
+            echo
+            echo "Built from [\`$SHA\`]($REPO_URL/tree/$SHA) by \`.github/workflows/release.yml\`."
+            echo "The tag is \`artifacts-<date>-<first 8 hex of sha256(build.json)>\`: the"
+            echo "assets name their own versions and commits, so what the tag adds is a"
+            echo "fingerprint of the pin set they were all built from."
+            echo
+            echo "## Manifest"
+            echo
+            echo "\`manifest-fragment.json\` is a mergeable patch for RotomLab's"
+            echo "\`internal/manifest/embedded.json\`, carrying these URLs, their digests,"
+            echo "the pinned decomp commits and their \`toolsHash\` values."
+            echo
+            echo "## Corresponding source (GNU GPL)"
+            echo
+            echo "Several assets here are under the GPL. The full notice — every upstream"
+            echo "URL, digest, licence, and how each component's corresponding source is"
+            echo "provided — is reproduced in full below, and is also in the repository at"
+            echo "the exact commit this release was built from:"
+            echo "[\`SOURCES.md\`]($REPO_URL/blob/$SHA/SOURCES.md)."
+            echo
+            echo "**busybox is the one that cannot be discharged by a link.** It is"
+            echo "GPLv2-only, and GPLv2 has no equivalent of GPLv3 §6(d), so pointing at"
+            echo "busybox.net is not a way to comply. The file **\`$bbsrc\`** attached to"
+            echo "this release is the complete corresponding source for the"
+            echo "\`busybox-$bbver-linux-amd64\` binary attached to this release, mirrored"
+            echo "byte-for-byte from upstream."
+            echo
+            echo "\`make\` and \`bash\` are GPLv3-or-later, built here from the unmodified"
+            echo "upstream tarballs named below by \`scripts/build-posix.sh\`; §6(d) is"
+            echo "satisfied by those pinned URLs together with the build scripts at the"
+            echo "commit above. devkitARM is devkitPro's build of patched GCC, binutils"
+            echo "and newlib — its corresponding source is devkitPro's \`buildscripts\` at"
+            echo "the pinned tag and commit below, not ftp.gnu.org's releases of the same"
+            echo "version numbers."
+            echo
+            echo "---"
+            echo
+            cat SOURCES.md
+          } >/tmp/release-notes.md
+
+          echo "--- release notes ($(wc -c </tmp/release-notes.md) bytes) ---"
+          cat /tmp/release-notes.md
+
+      - name: Publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.sources.outputs.sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eu
+          set --
+          while read -r name; do set -- "$@" "out/$name"; done </tmp/assets
+
+          flags=""
+          if [ "$PRERELEASE" = true ]; then flags="--prerelease"; fi
+
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            --target "$SHA" \
+            --title "RotomLab artifacts $TAG" \
+            --notes-file /tmp/release-notes.md \
+            $flags \
+            "$@"
+
+          echo "--- published assets ---"
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size) bytes  \(.url)"'
+
+      - name: Dry run — nothing was published
+        if: ${{ inputs.dry_run }}
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          echo "dry_run was set. Everything was built and verified; no release was created."
+          echo "Would have published as $TAG:"
+          sed 's/^/  /' /tmp/assets
+
+      # The JSON lines and the fragment, kept regardless of whether the release
+      # was published. On a dry run they are the only output; on a real one
+      # they are the record of what each script reported, which is what a later
+      # investigation would want and what the release page does not keep.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-metadata
+          path: |
+            out/*.json
+          if-no-files-found: warn
