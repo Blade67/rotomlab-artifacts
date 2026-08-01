@@ -1,0 +1,44 @@
+name: musl static spike
+
+# The gate on the whole pipeline: can pret's host tools be built statically
+# under musl? Runs against all three decomps so one run answers the question
+# for every game, and does not fail fast so a failure in one still reports the
+# others.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/spike.sh
+      - Containerfile
+      - .github/workflows/spike.yml
+
+jobs:
+  musl-static:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        decomp: [pokeemerald, pokefirered, pokeruby]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker rather than a container: job, because GitHub's runner injects a
+      # glibc-built node into container jobs, which cannot execute on Alpine.
+      #
+      # The decomp name reaches the shell through an environment variable
+      # rather than ${{ }} interpolation. It comes from the hardcoded matrix
+      # above so it is not attacker-controlled, but interpolating anything
+      # into a shell string is a habit worth not having in a workflow file.
+      - name: Build host tools statically under musl
+        env:
+          DECOMP: ${{ matrix.decomp }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -e DECOMP alpine:3.22 sh -c '
+            apk add --no-cache --quiet \
+              build-base musl-dev \
+              libpng-dev libpng-static \
+              zlib-dev zlib-static \
+              git make file >/dev/null
+            sh scripts/spike.sh "https://github.com/pret/$DECOMP"
+          '
