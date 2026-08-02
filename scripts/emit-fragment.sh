@@ -24,14 +24,44 @@
 # a stale copy here would be exactly the sort of thing to get it wrong.
 #
 # The cost of a patch is that it has to be applied rather than dropped in, and
-# that a merge is silent about a key it did not land on. Both are handled
-# below: the merge is one documented jq invocation, and the merged result must
-# contain no "TODO" placeholder anywhere. That single assertion is what makes
-# the patch safe — embedded.json ships every unpublished URL, digest and commit
-# as a TODO placeholder, so "no TODO survives" means every field this pipeline
-# is responsible for was actually reached. A typo'd artifact ID does not
-# silently add an unreferenced entry; it leaves the referenced one still
-# reading TODO, and the check fails.
+# that a merge is silent about a key it did not land on. The merge itself is
+# one documented jq invocation; the silence is what the checks below exist to
+# break.
+#
+# ---------------------------------------------------------------------------
+# Why those checks are positive, and what replaced the one that used to be here
+# ---------------------------------------------------------------------------
+# This header used to claim that "no TODO placeholder survives the merge" is
+# what makes the patch safe: embedded.json shipped every unpublished URL,
+# digest and commit as a TODO, so a field the fragment failed to reach stayed
+# reading TODO and the check fired.
+#
+# That was true for exactly one release. embedded.json now carries real values
+# for every one of those fields, so nothing in it reads TODO and the check can
+# never fire again — it is a guard over a condition that no longer occurs. A
+# reviewer demonstrated the hole: move a decomp pin in build.json, omit that
+# decomp's --hosttools input, run the command below. Exit 0, every check OK,
+# `go test -run Embedded` green — and ruby and sapphire still on the PREVIOUS
+# release's URL, commit and toolsHash, silently, in a manifest whose tag
+# advertises the new pin set.
+#
+# The absence check is kept (a genuinely new TODO field would still be caught)
+# but it is no longer load-bearing and must not be read as if it were. What
+# carries the weight now are three positive assertions — each states something
+# that must be TRUE of the merged manifest, so each one keeps failing as the
+# manifest fills in rather than going quiet:
+#
+#   1. Every game build.json pins is covered by a --hosttools input. This is
+#      the omission itself, caught before a byte of the fragment is written and
+#      without needing a RotomLab checkout to notice.
+#   2. Every artifact URL in the MERGED manifest points into this release. The
+#      fragment satisfies that trivially — it is the merged file that matters,
+#      because an entry the fragment never landed on keeps the old release's
+#      URL and looks perfectly well formed.
+#   3. Every game in the merged manifest carries the triple this run emitted:
+#      commit, hostTools ID and toolsHash all identical to the fragment's. A
+#      game that kept its old values fails here even if some other path had
+#      refreshed its URL.
 #
 # ---------------------------------------------------------------------------
 # The triple
@@ -186,6 +216,11 @@ merge_in() {
 # ---------------------------------------------------------------------------
 # 1. Host tools, and the games each bundle serves
 # ---------------------------------------------------------------------------
+# Accumulated so that step 1b can compare what the inputs covered against what
+# build.json pins. Word-splitting is safe: every name is bare_name-checked
+# before it is appended.
+COVERED_GAMES=
+
 for f in $HOSTTOOLS_JSON; do
   game=$(jq -er .game "$f")       || die "$f: no .game"
   artifact=$(jq -er .artifact "$f") || die "$f: no .artifact"
@@ -233,8 +268,40 @@ describe one clone; re-run build-host-tools.sh against the current pin."
           hostTools: $ht
        }}}')"
     log "game    $g -> $htid @ $commit, toolsHash $toolsHash"
+    COVERED_GAMES="$COVERED_GAMES $g"
   done
 done
+
+# ---------------------------------------------------------------------------
+# 1b. Every game build.json pins was covered by a --hosttools input
+#
+# The check that makes an omitted input an error rather than a silent hole.
+# release.yml derives its --hosttools arguments from build.json and so cannot
+# miss one; the developer command in fragment.yml is typed by hand, one
+# --hosttools per decomp, and is exactly where a decomp gets left out.
+#
+# Stated over GAMES rather than over decomps because games are what the
+# manifest is keyed by, and a decomp whose games[] gained an entry — a fourth
+# ROM built out of pokefirered, say — is the same failure with the same
+# symptom: a game keeping the previous release's triple.
+#
+# This runs before anything is written and needs no RotomLab checkout, so it
+# fires on the plain `emit-fragment.sh` invocation too, not only when
+# --validate-against is passed.
+# ---------------------------------------------------------------------------
+missing=
+for g in $(cfg '.decomps[].games[]'); do
+  case " $COVERED_GAMES " in
+    *" $g "*) : ;;
+    *) missing="$missing $g" ;;
+  esac
+done
+[ -z "$missing" ] || die "build.json pins games that no --hosttools input covers:$missing
+Each would keep whatever URL, commit and toolsHash the previous release left in
+embedded.json, while the tag being cut claims to fingerprint the current pin
+set. Pass one --hosttools per decomp in build.json — the decomps are:
+$(cfg '.decomps | keys[]' | sed 's/^/  /')"
+log "check   every game in build.json is covered: $(printf '%s' "$COVERED_GAMES" | wc -w) games"
 
 # ---------------------------------------------------------------------------
 # 2. The POSIX layer
@@ -346,17 +413,106 @@ sv=$(jq -er .schemaVersion "$MERGED")
 [ "$sv" = 1 ] || die "merged manifest declares schemaVersion $sv; this script
 writes the shape schemaVersion 1 describes and has not been reviewed against $sv"
 
-# The completeness check the patch approach rests on. embedded.json ships every
-# unpublished value as a TODO placeholder, and RotomLab's own checkPublished
-# refuses to build against one, so a surviving TODO is a field the fragment
-# failed to reach.
+# ---- not load-bearing: the placeholder sweep --------------------------------
+#
+# embedded.json shipped every unpublished value as a TODO placeholder, once,
+# before the first release. It contains none today, so this can only fire for a
+# field added to embedded.json in future and left as a placeholder. Worth a
+# line; worth nothing as a completeness guarantee. The two checks after it are
+# the ones that hold.
 leftover=$(jq -r '[paths(type == "string" and startswith("TODO"))
                    | map(tostring) | join(".")] | .[]' "$MERGED")
 [ -z "$leftover" ] || die "the merge left placeholders unfilled:
 $(printf '%s\n' "$leftover" | sed 's/^/  /')
-Each is a field this fragment was supposed to supply. A mistyped artifact ID
-shows up here rather than as a silently-added, unreferenced entry."
-log "check   no TODO placeholder survives the merge"
+Each is a field this fragment was supposed to supply."
+log "check   no TODO placeholder survives the merge (vacuous today; see header)"
+
+# ---- every artifact URL points into the release being cut -------------------
+#
+# The check that catches a merge which did not land. An entry the fragment
+# never touched keeps the URL, digest and kind the PREVIOUS release wrote —
+# well formed, downloadable, and describing bytes built from a different pin
+# set. Nothing about its shape is wrong, so no shape check can see it; the only
+# thing wrong with it is which release it belongs to.
+#
+# Every toolchain and every host-tools bundle in this manifest is published by
+# this pipeline, so "not under this release" has no legitimate case. Compared
+# against BASE_URL rather than against the bare tag so that the --base-url path
+# is held to the same rule.
+stale=$(jq -r --arg base "$BASE_URL/" '
+  [ (.toolchains // {} | to_entries[] | {sect: "toolchains", id: .key, plats: .value}),
+    (.hostTools  // {} | to_entries[] | {sect: "hostTools",  id: .key, plats: .value}) ]
+  | .[] as $e
+  | $e.plats | to_entries[]
+  | select(((.value.url // "") | startswith($base)) | not)
+  | "\($e.sect).\($e.id) (\(.key)): \(.value.url // "<no url>")"' "$MERGED")
+[ -z "$stale" ] || die "the merged manifest carries artifact URLs that are not
+in the release being cut:
+$(printf '%s\n' "$stale" | sed 's/^/  /')
+Expected every URL under: $BASE_URL/
+An entry the fragment did not land on keeps the previous release's URL. It
+parses, it downloads, and it is the wrong build — which is why this is checked
+on the MERGED file and not on the fragment, where it would be trivially true."
+log "check   every artifact URL in the merged manifest is under $BASE_URL/"
+
+# ---- the triple moves together, per game ------------------------------------
+#
+# commit, host-tools bundle and toolsHash describe one clone (see the header).
+# Two of the three are checked against sources OUTSIDE this fragment — the
+# commit and repo against build.json, which is what the release tag
+# fingerprints — so a game that quietly kept its old values cannot pass by
+# agreeing with a fragment that never mentioned it. toolsHash has no second
+# source by construction: it is computed over the cloned tree at build time, so
+# it is checked against what this run emitted, which is the assertion that the
+# hash in the manifest came from this run at all.
+drift=$(jq -s -r '
+  .[0] as $m | .[1] as $f | .[2] as $b
+  | ($b.decomps | to_entries
+     | map(.value as $d | $d.games[] | {key: ., value: $d})
+     | from_entries) as $pin
+  | $m.games | to_entries[]
+  | .key as $k | .value as $g
+  | ($pin[$k] // null) as $p
+  | ($f.games[$k] // null) as $fg
+  | [ (if $p == null
+       then "\($k): in the manifest, pinned by no decomp in build.json"
+       else empty end),
+      (if $p != null and $g.decomp.commit != $p.commit
+       then "\($k): manifest commit \($g.decomp.commit) but build.json pins \($p.commit)"
+       else empty end),
+      (if $p != null and $g.decomp.repo != $p.repo
+       then "\($k): manifest repo \($g.decomp.repo) but build.json says \($p.repo)"
+       else empty end),
+      (if $fg == null
+       then "\($k): this run emitted no commit, bundle or toolsHash for it"
+       else empty end),
+      (if $fg != null and $g.toolsHash != $fg.toolsHash
+       then "\($k): manifest toolsHash \($g.toolsHash) but this run computed \($fg.toolsHash)"
+       else empty end),
+      (if $fg != null and $g.hostTools != $fg.hostTools
+       then "\($k): manifest hostTools \($g.hostTools) but this run built \($fg.hostTools)"
+       else empty end),
+      (if ($m.hostTools[$g.hostTools] // null) == null
+       then "\($k): names host-tools bundle \($g.hostTools), which the manifest does not define"
+       else empty end) ]
+  | .[]' "$MERGED" "$OUT_FILE" "$BUILD_JSON")
+[ -z "$drift" ] || die "the commit/bundle/toolsHash triple does not move together:
+$(printf '%s\n' "$drift" | sed 's/^/  /')
+Each of the three describes one clone of one decomp at one commit. A game left
+behind at the previous release keeps all three of its old values, which is
+self-consistent and wrong."
+
+# Games built from one decomp must not disagree, or two projects out of one
+# repository would claim different provenance.
+split=$(jq -r '[.games | to_entries[]
+                | {ht: .value.hostTools, c: .value.decomp.commit, t: .value.toolsHash}]
+               | group_by(.ht)
+               | map(select((map({c, t}) | unique | length) > 1))
+               | .[] | tostring' "$MERGED")
+[ -z "$split" ] || die "games sharing a host-tools bundle disagree about which
+clone it came from:
+$(printf '%s\n' "$split" | sed 's/^/  /')"
+log "check   every game carries this run's commit, bundle and toolsHash together"
 
 # makeTargets and romNames must have identical key sets. manifest.validate()
 # checks it too; doing it here names the game and mode rather than reporting a
