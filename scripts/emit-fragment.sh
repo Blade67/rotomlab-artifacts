@@ -436,9 +436,21 @@ log "check   no TODO placeholder survives the merge (vacuous today; see header)"
 # thing wrong with it is which release it belongs to.
 #
 # Every toolchain and every host-tools bundle in this manifest is published by
-# this pipeline, so "not under this release" has no legitimate case. Compared
-# against BASE_URL rather than against the bare tag so that the --base-url path
-# is held to the same rule.
+# this pipeline, and release.yml rebuilds all of them on every release, so
+# "not under this release" has no legitimate case today. Compared against
+# BASE_URL rather than against the bare tag so that the --base-url path is held
+# to the same rule.
+#
+# Two futures would make this check wrong, and both should change it
+# deliberately rather than by weakening it in response to a red build:
+#
+#   - an artifact fetched from somewhere other than this pipeline (an upstream
+#     AppImage, say). That needs an explicit allowlist of IDs, not a relaxed
+#     prefix, so the exception is named and reviewable.
+#   - an incremental release that republishes only what changed. That is a
+#     different release model, and it removes the one property this check
+#     relies on: that a URL still pointing at an older tag can only mean the
+#     merge did not land.
 stale=$(jq -r --arg base "$BASE_URL/" '
   [ (.toolchains // {} | to_entries[] | {sect: "toolchains", id: .key, plats: .value}),
     (.hostTools  // {} | to_entries[] | {sect: "hostTools",  id: .key, plats: .value}) ]
