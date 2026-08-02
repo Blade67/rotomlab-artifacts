@@ -5,8 +5,15 @@ name: host tools
 # the record of that answer; this one is the real build, and Task 8's
 # release.yml will call the same script.
 #
-# Matrixed over all three decomps with fail-fast off, so one run answers the
+# Matrixed over every decomp with fail-fast off, so one run answers the
 # question for every game and a failure in one still reports the others.
+#
+# The matrix is READ FROM build.json rather than spelled out — the same rule,
+# for the same reason, as release.yml step 4. It matters more here than there:
+# this workflow FIRES ON A build.json PUSH, so a fourth decomp being added is
+# exactly the change it exists to see, and a hardcoded matrix was the one thing
+# guaranteed not to see it. The new decomp would have been built by nothing and
+# the run would have gone green on the commit that added it.
 on:
   workflow_dispatch:
   push:
@@ -19,12 +26,38 @@ on:
       - .github/workflows/host-tools.yml
 
 jobs:
+  # A matrix has to be known before the job it fans out exists, so the list is
+  # read in a job of its own and handed on as an output. Seconds, no network,
+  # and it fails on a malformed pin file before an hour of compiling.
+  decomps:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.read.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Also what makes the list safe to expand into a matrix: it confirms
+      # every .decomps key is a bare, filename-safe name, and build-host-tools.sh
+      # turns that name into paths.
+      - name: build.json is well formed
+        run: sh scripts/check-build-json.sh
+
+      - name: Read the decomp list out of build.json
+        id: read
+        run: |
+          set -eu
+          list=$(jq -c '.decomps | keys' build.json)
+          [ "$list" != "[]" ] || { echo "build.json lists no decomps"; exit 1; }
+          echo "matrix: $list"
+          echo "list=$list" >>"$GITHUB_OUTPUT"
+
   host-tools:
+    needs: decomps
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        decomp: [pokeemerald, pokefirered, pokeruby]
+        decomp: ${{ fromJSON(needs.decomps.outputs.list) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -34,9 +67,12 @@ jobs:
       # The package list mirrors Containerfile; go is needed for tools-hash.
       #
       # Values reach the shell through environment variables rather than ${{ }}
-      # interpolation. They come from the hardcoded matrix above so they are
-      # not attacker-controlled, but interpolating anything into a shell string
-      # is a habit worth not having in a workflow file.
+      # interpolation. The matrix is now derived from build.json rather than
+      # hardcoded, so this is no longer only a habit: the value originates in a
+      # committed file. check-build-json.sh has confirmed it is a bare
+      # filename-safe name, and passing it as an environment variable means
+      # even a name that slipped past that is quoted rather than pasted into a
+      # shell string.
       - name: Build host tools statically under musl
         env:
           DECOMP: ${{ matrix.decomp }}

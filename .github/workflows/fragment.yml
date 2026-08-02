@@ -98,6 +98,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Repeated from the sources job rather than depended on. `needs: sources`
+      # would gate an hour of compiling behind that job's network check of the
+      # corresponding-source URLs, which can flake on an upstream's bad minute.
+      # This step costs a second, and the derived decomp list below relies on
+      # its guarantee that every .decomps key is a bare filename-safe name.
+      - name: build.json is well formed
+        run: sh scripts/check-build-json.sh
+
       - name: Build every artifact and assemble the fragment
         run: |
           docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -c '
@@ -108,17 +116,37 @@ jobs:
               git make file \
               curl jq tar xz gzip zstd bzip2 go >/dev/null
             mkdir -p out
-            for d in pokeemerald pokefirered pokeruby; do
+
+            # The decomp list is READ FROM build.json, never spelled out here —
+            # the same rule, for the same reason, as release.yml step 4. It
+            # matters more in this workflow than in that one: this is a
+            # workflow that FIRES ON A build.json PUSH, so adding a fourth
+            # decomp is precisely the change it exists to see, and it was the
+            # one change a hardcoded list could not see. The fragment would
+            # have been assembled from three decomps, every check below would
+            # have passed on those three, and the run would have gone green on
+            # the commit that introduced the fourth.
+            DECOMPS=$(jq -r ".decomps | keys[]" build.json)
+            [ -n "$DECOMPS" ] || { echo "build.json lists no decomps"; exit 1; }
+            echo "decomps from build.json: $DECOMPS"
+
+            set --
+            for d in $DECOMPS; do
+              echo "=================== $d ==================="
               sh scripts/build-host-tools.sh "$d" >"out/$d.json"
+              cat "out/$d.json"
+              set -- "$@" --hosttools "out/$d.json"
             done
+
             sh scripts/build-posix.sh >out/posix.json
             sh scripts/mirror.sh      >out/mirror.json
 
+            # "$@" is one --hosttools pair per decomp in build.json. Passing
+            # them all is also what emit-fragment.sh now requires: it fails if
+            # any game build.json pins is not covered by an input.
             sh scripts/emit-fragment.sh \
               --tag ci-check \
-              --hosttools out/pokeemerald.json \
-              --hosttools out/pokefirered.json \
-              --hosttools out/pokeruby.json \
+              "$@" \
               --posix out/posix.json \
               --mirror out/mirror.json
           '
@@ -194,16 +222,35 @@ jobs:
           # to have compared them: this job's whole purpose is to be a second
           # opinion, and repeating the check with the script's own helper would
           # only restate its claim.
+          #
+          # The loop iterates BUILD.JSON's games, not the fragment's. Iterating
+          # the fragment's was a check that could only see what was already
+          # there: a decomp missing from the fragment was never visited, so the
+          # loop compared nothing and printed OK. The direction that catches a
+          # missing decomp is build.json -> fragment, and it is the direction
+          # that matters, because build.json is what the release tag claims to
+          # fingerprint.
           echo "--- the commits are build.json's, not something older ---"
-          for g in $(jq -r '.games | keys[]' "$f"); do
+          for g in $(jq -r '.decomps[].games[]' build.json); do
             want=$(jq -er --arg g "$g" \
               '[.decomps[] | select(.games | index($g)) | .commit] | first' build.json)
-            got=$(jq -er --arg g "$g" '.games[$g].decomp.commit' "$f")
+            got=$(jq -r --arg g "$g" '.games[$g].decomp.commit // ""' "$f")
+            [ -n "$got" ] || {
+              echo "FAIL: $g is pinned in build.json but absent from the fragment"; exit 1; }
             [ "$want" = "$got" ] || {
               echo "FAIL: $g is pinned at $want but the fragment says $got"; exit 1; }
             echo "  $g: $got"
           done
-          echo "OK: every fragment commit equals build.json's pin"
+          echo "OK: every game build.json pins is in the fragment, at its pin"
+
+          # And the other direction, so the two sets are equal rather than one
+          # containing the other: a fragment game nobody pins would be an
+          # artifact built from something build.json does not describe.
+          for g in $(jq -r '.games | keys[]' "$f"); do
+            jq -e --arg g "$g" '[.decomps[].games[]] | index($g)' build.json >/dev/null || {
+              echo "FAIL: the fragment has game $g, which build.json does not pin"; exit 1; }
+          done
+          echo "OK: the fragment names no game build.json does not pin"
 
           # The check that ties the manifest to the release rather than to a
           # report about it: every URL the fragment publishes must name a file
