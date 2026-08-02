@@ -504,7 +504,11 @@ drift=$(jq -s -r '
       (if $fg != null and $g.hostTools != $fg.hostTools
        then "\($k): manifest hostTools \($g.hostTools) but this run built \($fg.hostTools)"
        else empty end),
-      (if ($m.hostTools[$g.hostTools] // null) == null
+      # `// ""` so a game with no hostTools at all reports as a missing bundle
+      # rather than aborting the program with "cannot index object with null".
+      # manifest.validate() would reject it too, but this check runs first and
+      # has to survive input the parser has not seen yet.
+      (if ($m.hostTools[$g.hostTools // ""] // null) == null
        then "\($k): names host-tools bundle \($g.hostTools), which the manifest does not define"
        else empty end) ]
   | .[]' "$MERGED" "$OUT_FILE" "$BUILD_JSON")
